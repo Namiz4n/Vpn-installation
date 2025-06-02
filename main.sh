@@ -29,7 +29,7 @@ while true; do
 
     case $choice in
         1)
-            bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/VPN-Installation)
+            bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/install_openvpn.sh)
             ;;
         2)
             bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/wiregaurd)
