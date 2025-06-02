@@ -32,7 +32,7 @@ while true; do
             bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/install_openvpn.sh)
             ;;
         2)
-            bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/wiregaurd)
+            bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/wireguard-install.sh)
             ;;
         0)
             echo -e "${GREEN}Exiting...${NC}"
