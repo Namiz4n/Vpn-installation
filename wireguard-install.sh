@@ -403,19 +403,47 @@ enter_server_address() {
 			use_dns_name=0
 			;;
 	esac
+
 	if [ "$use_dns_name" = 1 ]; then
-		read -rp "Enter the DNS name of this VPN server: " server_addr_i
-		until check_dns_name "$server_addr_i"; do
-			echo "Invalid DNS name. You must enter a fully qualified domain name (FQDN)."
-			read -rp "Enter the DNS name of this VPN server: " server_addr_i
+		read -rp "Enter the DNS name or IP address of this VPN server: " server_addr_i
+		until check_dns_or_ip "$server_addr_i"; do
+			echo "Invalid input. You must enter a valid DNS name (FQDN) or IP address."
+			read -rp "Enter the DNS name or IP address of this VPN server: " server_addr_i
 		done
 		ip="$server_addr_i"
-		show_dns_name_note "$ip"
+		# فقط اگر ورودی DNS بود پیام بده
+		if [[ ! "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+			show_dns_name_note "$ip"
+		fi
 	else
 		detect_ip
 		check_nat_ip
 	fi
 }
+
+
+check_dns_or_ip() {
+	local addr=$1
+
+	# check IPv4
+	if [[ $addr =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+		IFS='.' read -r -a octets <<< "$addr"
+		for octet in "${octets[@]}"; do
+			if ((octet < 0 || octet > 255)); then
+				return 1
+			fi
+		done
+		return 0
+	fi
+
+	
+	if [[ $addr =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]]; then
+		return 0
+	fi
+
+	return 1
+}
+
 
 find_public_ip() {
 	ip_url1="http://ipv4.icanhazip.com"
