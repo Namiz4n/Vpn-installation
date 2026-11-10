@@ -1,49 +1,69 @@
 # Vpn-installation
 
-Bash helpers for installing and managing an **OpenVPN** server, a
-**WireGuard** server, and the popular **Astro** VPN/proxy toolkit on a
+Bash helpers for installing and managing a **OpenVPN** server, a
+**WireGuard** server, and a set of first-party VPN/proxy tools on a
 Linux VPS.
 
-- **OpenVPN** — powered by
-  [angristan/openvpn-install](https://github.com/angristan/openvpn-install)
-  (MIT), pinned to a fixed commit SHA.
-- **WireGuard** — a standalone installer based on
-  [Nyr/wireguard-install](https://github.com/Nyr/wireguard-install) and
-  [hwdsl2/wireguard-install](https://github.com/hwdsl2/wireguard-install)
-  (MIT).
-- **Astro toolkit** — a launcher that downloads and runs individual
-  [Soroushnk/Astro](https://github.com/Soroushnk/Astro) scripts at
-  runtime (Cisco/OpenConnect, IPsec, Outline, MTProto, V2Ray/Xray,
-  Reality.ez, X-UI, Liberta, WARP, SSH panel, IPtables tunnel, reverse
-  proxy, SSL). No Astro code is included in this repo; only its scripts
-  are downloaded and executed.
+- **OpenVPN** — installed through a pinned third-party installer script;
+  its URL and commit are in `install_openvpn.sh`.
+- **WireGuard** — a standalone installer based on a widely-used public
+  WireGuard installer (see the header of `wireguard-install.sh` for the
+  original copyright and license notice).
+- **Toolkit** — seven self-contained scripts under `tools/` that you can
+  run standalone or launch from the menu:
+  - `tools/ocserv.sh` — OpenConnect VPN server (ocserv + ocpasswd)
+  - `tools/mtproto.sh` — MTProto proxy for Telegram
+  - `tools/warp.sh` — Cloudflare WARP client
+  - `tools/tunnel.sh` — port-forward tunnel (iptables)
+  - `tools/reverse-proxy.sh` — nginx reverse proxy
+  - `tools/ssl.sh` — TLS certificates with certbot
+  - `tools/ssh-port.sh` — change the SSH port safely
 
 Everything is designed to be run as `root` on a fresh VPS.
 
-## Features
+## What it does
 
-- One command to **install** OpenVPN, WireGuard or any Astro tool.
-- **Add, list and revoke** VPN clients without re-running the installer.
-- **Uninstall** to cleanly remove a VPN and all of its configuration.
-- Pinned, checksum-verifiable upstream OpenVPN installer.
-- Pinned Astro ref (auto-updated weekly via a GitHub Action).
+- One command to **install** OpenVPN or WireGuard, or to launch any of
+  the seven toolkit tools.
+- **Add, list and revoke** VPN users/clients without re-running the
+  installer.
+- **Uninstall / revert** paths for each tool.
 - No leftover temp files are written to your working directory.
+
+## Menu
+
+Running `main.sh` shows a menu:
+
+| # | Tool |
+|---|------|
+| 1 | OpenVPN (pinned installer) |
+| 2 | WireGuard (standalone installer) |
+| 3 | OpenConnect VPN (ocserv) |
+| 4 | MTProto proxy (Telegram) |
+| 5 | Cloudflare WARP |
+| 6 | Port-forward tunnel (iptables/nftables) |
+| 7 | Nginx reverse proxy |
+| 8 | SSL certificate (certbot) |
+| 9 | Change SSH port |
+| 0 | Quit |
 
 ## Supported operating systems
 
-**OpenVPN** (from angristan/openvpn-install):
-Debian, Ubuntu, Fedora, openSUSE, CentOS / Rocky Linux / AlmaLinux,
-Oracle Linux, Amazon Linux 2023 and Arch Linux.
+Each script checks the OS at start and refuses to run on an unsupported
+distribution. What the scripts check, exactly:
 
-**WireGuard** (from the bundled `wireguard-install.sh`):
-Ubuntu (20.04+), Debian (11+), AlmaLinux, Rocky Linux, CentOS (8+),
-Fedora and openSUSE.
-
-**Astro tools** (from Soroushnk/Astro):
-Ubuntu 20.04+ (per its README).
-
-Run the installer on your VPS's primary OS. Both installers will refuse
-to run on an unsupported distribution.
+- **`main.sh` / `install_openvpn.sh` / `wireguard-install.sh`** — detect
+  the distro via `/etc/os-release` and `apt-get` / `dnf` / `yum`
+  availability. WireGuard supports the distros it was originally written
+  for (Ubuntu, Debian, Fedora, openSUSE, Rocky/Alma/CentOS). The OpenVPN
+  installer supports a broad range of distros; consult its own output.
+- **`tools/ocserv.sh`, `tools/mtproto.sh`, `tools/tunnel.sh`,
+  `tools/reverse-proxy.sh`, `tools/ssl.sh`, `tools/ssh-port.sh`** —
+  Debian/Ubuntu only (they check for `/etc/debian_version` or an
+  `ID`/`ID_LIKE` value of `debian`/`ubuntu` and exit otherwise).
+- **`tools/warp.sh`** — Debian/Ubuntu (apt) and RHEL-family
+  (dnf/yum). It detects the package manager and installs the Cloudflare
+  WARP client from Cloudflare's official repository.
 
 ## Usage
 
@@ -53,24 +73,19 @@ The quickest way to start is the interactive menu:
 bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/main.sh)
 ```
 
-The menu downloads the OpenVPN / WireGuard / Astro scripts on demand
-(into a temp file) and runs them, so nothing is left behind in your
-current directory. You can override the git refs used to fetch those
-scripts with the `VPN_INSTALL_REF` (default: `main`) and `ASTRO_REF`
-(default: a pinned SHA; set to `main` to always follow Astro's latest
-main branch) environment variables:
+The menu downloads each script on demand (into a temp file) and runs it,
+so nothing is left behind in your current directory. Override the git
+ref used to fetch this repo's own scripts with `VPN_INSTALL_REF`
+(default: `main`):
 
 ```bash
-VPN_INSTALL_REF=stable ASTRO_REF=main \
-  bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/main.sh)
+VPN_INSTALL_REF=stable bash <(curl -Ls https://raw.githubusercontent.com/Namiz4n/Vpn-installation/refs/heads/main/main.sh)
 ```
 
-### OpenVPN (non-interactive examples)
+### OpenVPN (pinned installer)
 
-The OpenVPN helper is a thin wrapper that downloads and runs the
-upstream installer, so any upstream flag works. It is *not* a
-single-command installer like WireGuard — you must either use the menu
-or pass subcommands explicitly:
+`install_openvpn.sh` is a thin wrapper that downloads a pinned upstream
+installer and runs it, so any upstream flag works:
 
 ```bash
 # Interactive install
@@ -83,17 +98,12 @@ bash install_openvpn.sh install --port 443 --protocol tcp
 bash install_openvpn.sh client add alice
 bash install_openvpn.sh client list
 bash install_openvpn.sh client revoke alice
-bash install_openvpn.sh client renew alice
-
-# Show connected clients / renew the server cert
-bash install_openvpn.sh server status
-bash install_openvpn.sh server renew
 
 # Uninstall
 bash install_openvpn.sh uninstall
 ```
 
-You can also download the upstream installer directly:
+To download the upstream installer directly (manual step):
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/angristan/openvpn-install/ad22fd9eb0c8569a885f836ef6e37576d8702e9f/openvpn-install.sh
@@ -101,9 +111,9 @@ chmod +x openvpn-install.sh
 ./openvpn-install.sh install
 ```
 
-### WireGuard (non-interactive examples)
+The commit SHA above is pinned in `install_openvpn.sh` (`REF`).
 
-`wireguard-install.sh` is self-contained:
+### WireGuard (standalone)
 
 ```bash
 # Interactive setup
@@ -121,41 +131,55 @@ bash wireguard-install.sh --removeclient "laptop"
 bash wireguard-install.sh --uninstall
 ```
 
-### Astro tools (via the menu)
+### Toolkit tools
 
-The menu's Astro section downloads and runs each tool's own script
-from Soroushnk/Astro's `main` branch (or the pinned ref). No Astro
-code ships with this repository.
+Each tool is a standalone script. Run it directly:
+
+```bash
+bash tools/ocserv.sh install
+bash tools/ocserv.sh add-user alice
+
+bash tools/mtproto.sh install
+bash tools/mtproto.sh add-user <64-hex-key>
+
+bash tools/warp.sh install
+bash tools/warp.sh status
+bash tools/warp.sh disconnect
+bash tools/warp.sh uninstall
+
+bash tools/tunnel.sh add 8080 203.0.113.10 80 tcp
+bash tools/tunnel.sh list
+bash tools/tunnel.sh remove 8080 203.0.113.10 80 tcp
+
+bash tools/reverse-proxy.sh add example.com 203.0.113.10:8080
+bash tools/reverse-proxy.sh remove example.com
+
+bash tools/ssl.sh issue example.com
+bash tools/ssl.sh status
+
+bash tools/ssh-port.sh change 2222
+bash tools/ssh-port.sh disable-old-port
+```
+
+Or launch any of them from the menu.
 
 ## Security notes
 
-- **Run as root.** Both installers and every Astro tool require root.
-  The scripts check this and exit with an error if you are not root;
-  they never re-execute via `su`.
-- **Pinned upstream versions.** The OpenVPN wrapper downloads
-  angristan/openvpn-install at a fixed commit SHA. The Astro launcher
-  pins Astro's main branch at a fixed SHA (auto-bumped weekly). Re-pin
-  the `REF` / `ASTRO_REF` variables whenever you update them. You may
-  also set `EXPECTED_SHA256` in `install_openvpn.sh` to verify the
-  download before it is executed.
-- **Keep client configs private.** Client `.ovpn` / `.conf` files
+- **Run as root.** Every script checks this and exits with an error if
+  you are not root.
+- **Pinned upstream versions.** The OpenVPN wrapper downloads a pinned
+  commit; you may also set `EXPECTED_SHA256` in `install_openvpn.sh` to
+  verify the download's integrity before it is executed.
+- **Back up before use.** Config-editing tools (`ssh-port.sh`,
+  `reverse-proxy.sh`, `ssl.sh`) back up the files they modify before
+  changing them.
+- **Keep client configs private.** Client `.ovpn` / `.conf` / key files
   embed private keys. Never commit them to version control or share
-  them publicly, and restrict their file permissions on the server
-  (the installers set `chmod 600`).
-- **Astro scripts are third-party.** They are not bundled with this
-  repository and are run as root from Soroushnk/Astro. Review their
-  source before use; they are GPL-3.0 licensed.
+  them publicly, and keep their file permissions restrictive.
 
-## Credits & licenses
+## License
 
 This repository's own code is MIT-licensed (see `LICENSE`).
 
-- [angristan/openvpn-install](https://github.com/angristan/openvpn-install)
-  — MIT. The OpenVPN installer used by `install_openvpn.sh`.
-- [Nyr/wireguard-install](https://github.com/Nyr/wireguard-install) and
-  [hwdsl2/wireguard-install](https://github.com/hwdsl2/wireguard-install)
-  — MIT. The basis for the bundled `wireguard-install.sh`.
-- [Soroushnk/Astro](https://github.com/Soroushnk/Astro) by Soroush
-  Nekoozadeh — GPL-3.0. Only *launched* at runtime from its own
-  repository; we do not include or modify its code. See
-  [its LICENSE](https://github.com/Soroushnk/Astro/blob/main/LICENSE).
+`wireguard-install.sh` contains code under its own MIT license; see the
+file header for the original copyright notice and attribution.
