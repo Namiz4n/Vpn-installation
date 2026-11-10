@@ -39,7 +39,7 @@ fi
 # --- temp-file cleanup -------------------------------------------------------
 # Registered right after the temp file is created (see below). Defined up top
 # so it is clearly reachable; invoked only via the EXIT trap.
-# shellcheck disable=SC2329  # cleanup is invoked only via the EXIT trap
+# shellcheck disable=SC2329,SC2317  # invoked only via the EXIT trap
 cleanup() { rm -f "$tmp_installer" 2>/dev/null || true; }
 
 # --- show client info (safe: no private keys, validated name) ---------------
