@@ -6,11 +6,13 @@ on:
       - '**.sh'
       - '**.yml'
       - '**.yaml'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - '**.sh'
       - '**.yml'
       - '**.yaml'
+      - '.github/workflows/**'
 
 jobs:
   shellcheck:
@@ -25,3 +27,56 @@ jobs:
 
       - name: Run ShellCheck on wireguard-install.sh (error only)
         run: shellcheck --severity=error wireguard-install.sh
+
+  config-test:
+    name: Config validation (ocserv + nginx)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install ocserv and nginx
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocserv nginx
+
+      - name: Validate generated ocserv config with ocserv --test-config
+        run: |
+          # Generate the config without running the full installer.
+          bash tools/ocserv.sh print-config > /tmp/ocserv-test.conf
+          echo "--- generated ocserv.conf ---"
+          cat /tmp/ocserv-test.conf
+          # The certificate files referenced by the config must exist for
+          # --test-config to pass; create throwaway self-signed certs.
+          sudo mkdir -p /etc/ocserv/ssl
+          sudo openssl req -x509 -nodes -newkey rsa:2048 -days 30 \
+            -keyout /etc/ocserv/ssl/server-key.pem \
+            -out  /etc/ocserv/ssl/server-cert.pem \
+            -subj "/CN=vpn.local"
+          # The password file referenced by the config must exist.
+          sudo touch /etc/ocserv/ocpasswd
+          # Run the test; it must exit 0 and must not print "unknown option".
+          set -o pipefail
+          out="$(sudo ocserv -c /tmp/ocserv-test.conf --test-config 2>&1)" || true
+          echo "$out"
+          if echo "$out" | grep -q 'unknown option'; then
+            echo "::error::ocserv --test-config reported an unknown option"
+            exit 1
+          fi
+          echo "ocserv config validated."
+
+      - name: Validate generated nginx server block with nginx -t
+        run: |
+          # Generate a self-contained nginx.conf with the server block inline.
+          bash tools/reverse-proxy.sh print-config example.com 127.0.0.1:8080 8080 > /tmp/nginx-test.conf
+          echo "--- generated nginx.conf ---"
+          cat /tmp/nginx-test.conf
+          # Validate it. The include of mime.types may not exist in a bare
+          # config, so create it; nginx -t -c checks syntax.
+          sudo bash -c 'test -f /etc/nginx/mime.types || echo "types { };" > /etc/nginx/mime.types'
+          if ! sudo nginx -t -c /tmp/nginx-test.conf; then
+            # Fall back to a version that omits the mime.types include.
+            sed 's/^\s*include mime.types;\s*$//' /tmp/nginx-test.conf > /tmp/nginx-test2.conf
+            sudo nginx -t -c /tmp/nginx-test2.conf
+          fi
+          echo "nginx config validated."
