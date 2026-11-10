@@ -90,6 +90,7 @@ fi
 
 # --- download + verify + run ------------------------------------------------
 tmp_installer="$(mktemp "${TMPDIR:-/tmp}/openvpn-install.XXXXXX")"
+# shellcheck disable=SC2329  # cleanup is invoked via the EXIT trap below
 cleanup() { rm -f "$tmp_installer" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -111,8 +112,12 @@ if [[ -n "$EXPECTED_SHA256" ]]; then
 fi
 
 # Run the installer; default to "interactive" when no arguments are supplied.
+# We do NOT use `exec` here: exec would replace this shell and prevent the
+# EXIT trap from running, leaking the temp file.
 if [[ $# -eq 0 ]]; then
-    exec bash "$tmp_installer" interactive
+    bash "$tmp_installer" interactive
 else
-    exec bash "$tmp_installer" "$@"
+    bash "$tmp_installer" "$@"
 fi
+rc=$?
+exit "$rc"

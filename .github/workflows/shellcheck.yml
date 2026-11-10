@@ -21,17 +21,7 @@ jobs:
         uses: actions/checkout@692973e3d9cc13a8943999264a97414c2ca7412a # v4.5.0
 
       - name: Run ShellCheck on our own scripts (strict)
-        uses: ludeeus/action-shellcheck@master
-        with:
-          file: main.sh
-
-      - name: Run ShellCheck on install_openvpn.sh (strict)
-        uses: ludeeus/action-shellcheck@master
-        with:
-          file: install_openvpn.sh
+        run: shellcheck main.sh install_openvpn.sh tools/*.sh
 
       - name: Run ShellCheck on wireguard-install.sh (error only)
-        uses: ludeeus/action-shellcheck@master
-        with:
-          file: wireguard-install.sh
-          severity: error
+        run: shellcheck --severity=error wireguard-install.sh
