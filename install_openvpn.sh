@@ -36,6 +36,12 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
+# --- temp-file cleanup -------------------------------------------------------
+# Registered right after the temp file is created (see below). Defined up top
+# so it is clearly reachable; invoked only via the EXIT trap.
+# shellcheck disable=SC2329  # cleanup is invoked only via the EXIT trap
+cleanup() { rm -f "$tmp_installer" 2>/dev/null || true; }
+
 # --- show client info (safe: no private keys, validated name) ---------------
 # Print a client's generated .ovpn config path and certificate location only.
 # Private key files are never displayed.
@@ -90,8 +96,6 @@ fi
 
 # --- download + verify + run ------------------------------------------------
 tmp_installer="$(mktemp "${TMPDIR:-/tmp}/openvpn-install.XXXXXX")"
-# shellcheck disable=SC2329  # cleanup is invoked via the EXIT trap below
-cleanup() { rm -f "$tmp_installer" 2>/dev/null || true; }
 trap cleanup EXIT
 
 echo "Downloading OpenVPN installer (commit ${REF:0:7})..." >&2
