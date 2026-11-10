@@ -2,15 +2,17 @@
 #
 # tools/ocserv.sh -- OpenConnect VPN server (ocserv) installer / manager
 #
-# Installs ocserv from the distro package manager, generates a certificate
-# (self-signed by default, or an existing one you point to), and manages
-# user accounts via ocpasswd. Subcommands:
+# Installs ocserv (which bundles ocpasswd) from the distro package manager,
+# generates a certificate (self-signed by default, or an existing one you
+# point to), and manages user accounts via ocpasswd.
 #
+# Subcommands:
 #   install [existing <cert-path>]   install ocserv + config + cert + NAT + firewall
-#   add-user <name>                  add a user
+#   add-user <name> [password]       add a user (interactive if no password)
 #   remove-user <name>               remove a user
 #   list-users                       list users
-#   uninstall                        purge ocserv (certificate is kept)
+#   print-config                     print the ocserv.conf we would write (for CI/tests)
+#   uninstall                        purge ocserv (certificate + users kept)
 #
 # OS: Debian/Ubuntu only (refuses to run otherwise).
 #
@@ -23,19 +25,22 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 CONF="/etc/ocserv/ocserv.conf"
-PASSWORD_FILE="/etc/ocserv/ocserv-password"
+PASSWORD_FILE="/etc/ocserv/ocpasswd"
 SERVICE="ocserv"
-CERT_DIR="/etc/ocserv/certs"
-CERT="${CERT_DIR}/server.crt"
-KEY="${CERT_DIR}/server.key"
+CERT_DIR="/etc/ocserv/ssl"
+CERT="${CERT_DIR}/server-cert.pem"
+KEY="${CERT_DIR}/server-key.pem"
 SELF_SIGNED_MARKER="${CERT_DIR}/.self-signed"
 CONFIGURED_MARKER="/etc/ocserv/.vpn-install-configured"
-DEFAULT_PORT=443
-SUBNET="10.8.0.0/24"
+NAT_SERVICE="vpn-install-ocserv-nat"
+DEFAULT_TCP_PORT=443
+DEFAULT_UDP_PORT=443
+SUBNET="192.168.1.0"
+NETMASK="255.255.255.0"
 
-log() { echo -e "${GREEN}$*${NC}"; }
+log()  { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}Warning: $*${NC}" >&2; }
-err() { echo -e "${RED}$*${NC}" >&2; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -50,12 +55,10 @@ detect_os() {
         id_like="$(grep -E '^(ID|ID_LIKE)=' /etc/os-release || true)"
     fi
     if [[ -f /etc/debian_version || "$id_like" =~ (debian|ubuntu) ]]; then
-        OS_NAME="debian"
-        OS_VERSION="$(grep -E '^VERSION_ID=' /etc/os-release 2>/dev/null | sed 's/VERSION_ID=//;s/"//g' || true)"
-    else
-        err "Unsupported distribution. This script requires Debian or Ubuntu."
-        exit 1
+        return 0
     fi
+    err "Unsupported distribution. This script requires Debian or Ubuntu."
+    exit 1
 }
 
 apt_get() {
@@ -83,14 +86,124 @@ valid_port() {
     fi
 }
 
-# --- subcommands ------------------------------------------------------------
+# Detect the outbound interface that carries the default route so NAT can
+# masquerade on the right device. Fall back to the first non-loopback one.
+default_route_iface() {
+    local iface
+    iface="$(ip route get 1.1.1.1 2>/dev/null | grep -oE 'dev [^ ]+' | awk '{print $2}' | head -n1 || true)"
+    if [[ -z "${iface:-}" || "$iface" == "lo" ]]; then
+        iface="$(ip -o link show 2>/dev/null | awk '{print $2}' | grep -v '^lo$' | head -n1 || true)"
+    fi
+    printf '%s\n' "${iface:-}"
+}
+
+_ufw_active() {
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+
+_firewalld_active() {
+    command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null
+}
+
+# open_firewall <port> <tcp|udp|both>
+open_firewall() {
+    local port="$1" proto="${2:-both}" p
+    for p in $( [[ "$proto" == "tcp" || "$proto" == "both" ]] && printf 'tcp ' )$( [[ "$proto" == "udp" || "$proto" == "both" ]] && printf 'udp' ); do
+        if _ufw_active; then
+            ufw allow "${port}/${p}"
+        elif _firewalld_active; then
+            firewall-cmd --permanent --add-port="${port}/${p}"
+            firewall-cmd --reload
+        fi
+    done
+}
+
+# close_firewall <port> <tcp|udp|both>
+close_firewall() {
+    local port="$1" proto="${2:-both}" p
+    for p in $( [[ "$proto" == "tcp" || "$proto" == "both" ]] && printf 'tcp ' )$( [[ "$proto" == "udp" || "$proto" == "both" ]] && printf 'udp' ); do
+        if _ufw_active; then
+            ufw delete allow "${port}/${p}" 2>/dev/null || true
+        elif _firewalld_active; then
+            firewall-cmd --permanent --remove-port="${port}/${p}" 2>/dev/null || true
+            firewall-cmd --reload 2>/dev/null || true
+        fi
+    done
+}
+
+# Write the ocserv config. Quoted heredoc delimiter so no shell expansion of
+# the config values; we substitute the real values with sed afterwards to
+# keep a single source of truth.
+# Emit the ocserv config to stdout. No file writes; the caller redirects.
+# This is the single source of truth for both the on-disk config and the
+# CI-tested print-config mode.
+emit_config() {
+    local tcp_port="$1" udp_port="$2"
+    cat <<EOF
+# /etc/ocserv/ocserv.conf -- generated by tools/ocserv.sh
+# Authentication via a plaintext password file managed with ocpasswd.
+auth = "plain[passwd=${PASSWORD_FILE}]"
+
+# TCP and UDP port numbers
+tcp-port = ${tcp_port}
+udp-port = ${udp_port}
+
+# Server certificate and key
+server-cert = ${CERT}
+server-key  = ${KEY}
+
+# Pool of addresses to lease to clients
+ipv4-network = ${SUBNET}
+ipv4-netmask = ${NETMASK}
+
+# DNS servers handed to clients
+dns = 1.1.1.1
+dns = 8.8.8.8
+
+# Client limits
+max-clients = 64
+max-same-clients = 4
+
+# Push the default route to clients
+route = default
+
+# The virtual network interface ocserv creates
+device = vpns
+
+# Run as an unprivileged user
+run-as-user = ocserv
+run-as-group = ocserv
+EOF
+}
+
+write_config() {
+    local tcp_port="$1" udp_port="$2"
+    local backup=""
+    if [[ -f "$CONF" ]]; then
+        backup="${CONF}.bak.$(date +%s)"
+        cp "$CONF" "$backup"
+        log "Backed up existing $CONF to $backup"
+    fi
+    emit_config "$tcp_port" "$udp_port" > "$CONF"
+    chmod 640 "$CONF"
+}
+
+cmd_print_config() {
+    local tcp_port="${VPN_TCP_PORT:-$DEFAULT_TCP_PORT}"
+    local udp_port="${VPN_UDP_PORT:-$DEFAULT_UDP_PORT}"
+    valid_port "$tcp_port"
+    valid_port "$udp_port"
+    # Print to stdout only (no file writes) so CI/tests can capture it.
+    emit_config "$tcp_port" "$udp_port"
+}
 
 cmd_install() {
     require_root
     detect_os
-    log "Installing ocserv on ${OS_NAME} ${OS_VERSION}..."
+    log "Installing ocserv..."
     apt_get update
-    apt_get install ocserv ocpasswd openssl
+    # ocserv bundles ocpasswd; openssl for self-signed certs
+    apt_get install ocserv openssl
 
     mkdir -p "$CERT_DIR"
 
@@ -104,14 +217,16 @@ cmd_install() {
         log "Using existing certificate: $existing"
         cp "$existing" "$CERT"
         local key_guess="${existing%.crt}.key"
+        key_guess="${existing%.pem}.key"
         if [[ -f "$key_guess" ]]; then
             cp "$key_guess" "$KEY"
-            chmod 600 "$KEY"
         else
+            key_guess="${existing%.pem}.key"
             warn "Private key not found at $key_guess; ocserv will not start until one is placed there."
         fi
         rm -f "$SELF_SIGNED_MARKER"
         chmod 644 "$CERT"
+        chmod 600 "$KEY"
     else
         log "Generating self-signed certificate (CN=vpn.local)..."
         openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
@@ -131,74 +246,82 @@ cmd_install() {
     fi
 
     # --- main config ----------------------------------------------------------
-    local domain="${VPN_DOMAIN:-vpn.local}"
-    local port="${VPN_PORT:-$DEFAULT_PORT}"
-    valid_port "$port"
+    local tcp_port="${VPN_TCP_PORT:-$DEFAULT_TCP_PORT}"
+    local udp_port="${VPN_UDP_PORT:-$DEFAULT_UDP_PORT}"
+    valid_port "$tcp_port"
+    valid_port "$udp_port"
     if [[ -f "$CONFIGURED_MARKER" ]]; then
         log "Already configured ($CONFIGURED_MARKER present); not rewriting $CONF."
     else
-        if [[ -f "$CONF" ]]; then
-            cp "$CONF" "${CONF}.bak.$(date +%s)"
-        fi
-        cat > "$CONF" <<EOF
-# ocserv.conf -- generated by tools/ocserv.sh
-auth = "plain[realm=\"vpn\",program=\"$PASSWORD_FILE\"]"
-tls_cert = \"$CERT\"
-tls_private_key = \"$KEY\"
-listen_port = $port
-server_name = \"$domain\"
-max_clients = 100
-max_conns_per_ip = 5
-pid_file = \"/var/run/ocserv.pid\"
-local_IPs = $SUBNET
-banner_text = \"VPN server. No warranty.\"
-dns = 8.8.8.8
-dns = 1.1.1.1
-compression = \"none\"
-EOF
+        write_config "$tcp_port" "$udp_port"
         touch "$CONFIGURED_MARKER"
     fi
 
-    # --- IP forwarding + NAT --------------------------------------------------
+    # --- IP forwarding --------------------------------------------------------
     local sysctl_conf="/etc/sysctl.d/99-ocserv-forward.conf"
     echo "net.ipv4.ip_forward = 1" > "$sysctl_conf"
     sysctl -p "$sysctl_conf"
 
-    if command -v iptables >/dev/null 2>&1 && ! systemctl is-active --quiet firewalld 2>/dev/null; then
-        local nat_file="/etc/ocserv/nat.rules"
-        cat > "$nat_file" <<EOF
-#!/bin/bash
-iptables -t nat -A POSTROUTING -s $SUBNET ! -o ocserv0 -j MASQUERADE
+    # --- NAT (MASQUERADE on the real default-route interface, persisted) ------
+    local iface
+    iface="$(default_route_iface)"
+    if [[ -z "$iface" ]]; then
+        warn "Could not detect the default-route interface; skipping NAT setup."
+    else
+        log "Enabling NAT on interface $iface."
+        # A small systemd service that applies the MASQUERADE rule at boot.
+        cat > "/etc/systemd/system/${NAT_SERVICE}.service" <<EOF
+[Unit]
+Description=MASQUERADE for ocserv VPN client traffic (${SUBNET})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/iptables -t nat -A POSTROUTING -s ${SUBNET} -o ${iface} -j MASQUERADE
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
-        chmod +x "$nat_file"
+        # Apply it now (idempotent: drop an identical rule first).
+        if iptables -t nat -C POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE 2>/dev/null; then
+            log "NAT rule already present."
+        else
+            iptables -t nat -A POSTROUTING -s "$SUBNET" -o "$iface" -j MASQUERADE
+        fi
+        systemctl enable "$NAT_SERVICE"
+        systemctl start "$NAT_SERVICE"
     fi
 
-    # --- firewall port --------------------------------------------------------
-    if command -v ufw >/dev/null 2>&1 && ufw is active >/dev/null 2>&1; then
-        ufw allow "$port/tcp"
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="$port/tcp"
-        firewall-cmd --reload
-    fi
+    # --- firewall port (tcp + udp) -------------------------------------------
+    open_firewall "$tcp_port" tcp
+    open_firewall "$udp_port" udp
 
     # --- enable service -------------------------------------------------------
     systemctl enable "$SERVICE"
     systemctl restart "$SERVICE"
 
-    log "ocserv is running on port $port."
-    log "Server name (for client): $domain"
-    log "Add a user with:  ocserv.sh add-user <name>"
+    log "ocserv is running on TCP $tcp_port / UDP $udp_port."
+    log "Server domain for clients: vpn.local (or your configured domain)."
+    log "Add a user with:  ocserv.sh add-user <name> <password>"
 }
 
 cmd_add_user() {
     require_root
-    local name="$1"
+    local name="${1:-}"
     valid_user "$name"
     if [[ ! -f "$PASSWORD_FILE" ]]; then
         err "User database not found. Run 'install' first."
         exit 1
     fi
-    ocpasswd -f "$PASSWORD_FILE" "$name"
+    if [[ -n "${2:-}" ]]; then
+        # Non-interactive: hash the provided password with ocpasswd -c -n
+        # (ocpasswd -n adds a user without prompting when given the name).
+        ocpasswd -n -c "$PASSWORD_FILE" "$name" <<< "${2}"
+    else
+        ocpasswd -c "$PASSWORD_FILE" "$name"
+    fi
     log "User '$name' added."
     if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
         systemctl restart "$SERVICE"
@@ -207,7 +330,7 @@ cmd_add_user() {
 
 cmd_remove_user() {
     require_root
-    local name="$1"
+    local name="${1:-}"
     valid_user "$name"
     if [[ ! -f "$PASSWORD_FILE" ]]; then
         err "User database not found."
@@ -239,12 +362,20 @@ cmd_list_users() {
 cmd_uninstall() {
     require_root
     detect_os
-    warn "Purging ocserv. Your certificate and user database will be kept."
+    warn "Purging ocserv. Certificate and user database will be kept."
     if systemctl is-active --quiet "$SERVICE" 2>/dev/null; then
         systemctl stop "$SERVICE"
     fi
     systemctl disable "$SERVICE" 2>/dev/null || true
-    apt_get purge ocserv ocpasswd
+    if systemctl is-enabled "$NAT_SERVICE" 2>/dev/null; then
+        systemctl stop "$NAT_SERVICE" 2>/dev/null || true
+        systemctl disable "$NAT_SERVICE" 2>/dev/null || true
+    fi
+    rm -f "/etc/systemd/system/${NAT_SERVICE}.service"
+    systemctl daemon-reload
+    apt_get purge ocserv
+    close_firewall "${VPN_TCP_PORT:-$DEFAULT_TCP_PORT}" tcp
+    close_firewall "${VPN_UDP_PORT:-$DEFAULT_UDP_PORT}" udp
     rm -f "$CONFIGURED_MARKER"
     log "Uninstalled. $CONF, $CERT and $PASSWORD_FILE were left in place."
 }
@@ -263,8 +394,8 @@ main() {
             fi
             ;;
         add-user)
-            [[ -z "${2:-}" ]] && { err "Usage: ocserv.sh add-user <name>"; exit 1; }
-            cmd_add_user "$2"
+            [[ -z "${2:-}" ]] && { err "Usage: ocserv.sh add-user <name> [password]"; exit 1; }
+            cmd_add_user "$2" "${3:-}"
             ;;
         remove-user)
             [[ -z "${2:-}" ]] && { err "Usage: ocserv.sh remove-user <name>"; exit 1; }
@@ -273,11 +404,14 @@ main() {
         list-users)
             cmd_list_users
             ;;
+        print-config)
+            cmd_print_config
+            ;;
         uninstall)
             cmd_uninstall
             ;;
         help|*)
-            echo "Usage: ocserv.sh {install [existing <cert-path>] | add-user <name> | remove-user <name> | list-users | uninstall}"
+            echo "Usage: ocserv.sh {install [existing <cert-path>] | add-user <name> [password] | remove-user <name> | list-users | print-config | uninstall}"
             ;;
     esac
 }
