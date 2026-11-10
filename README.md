@@ -12,7 +12,8 @@ Linux VPS.
 - **Toolkit** — seven self-contained scripts under `tools/` that you can
   run standalone or launch from the menu:
   - `tools/ocserv.sh` — OpenConnect VPN server (ocserv + ocpasswd)
-  - `tools/mtproto.sh` — MTProto proxy for Telegram
+  - `tools/mtproto.sh` — MTProto proxy for Telegram (pinned third-party
+    binary: 9seconds/mtg, URL and version are in `tools/mtproto.sh`)
   - `tools/warp.sh` — Cloudflare WARP client
   - `tools/tunnel.sh` — port-forward tunnel (iptables)
   - `tools/reverse-proxy.sh` — nginx reverse proxy
@@ -158,10 +159,20 @@ bash tools/ssl.sh issue example.com
 bash tools/ssl.sh status
 
 bash tools/ssh-port.sh change 2222
+# After this, sshd listens on BOTH 22 and 2222. Test a second session:
+#   ssh -p 2222 user@host
+# Only once that works, close the old port (the old port stays open until
+# you run this explicitly):
 bash tools/ssh-port.sh disable-old-port
 ```
 
 Or launch any of them from the menu.
+
+> **SSH port safety:** `ssh-port.sh change` keeps the old port open until
+> you run `disable-old-port`. It opens the new port in the firewall first,
+> verifies sshd is actually listening on the new port before finishing, and
+> rolls back automatically if `sshd -t` or the listener check fails. Always
+> test a second session before closing the first one.
 
 ## Security notes
 
