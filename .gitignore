@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+
+# Local tools (not part of the repo)
+bin/
+_install_shellcheck.ps1
+
+# Fetched reference files
+_upstream_openvpn-install.sh
+_astro_*
+
+# Local helper scripts (not part of the repo)
+_check_*
+_clean_*
+_commit.ps1
+_do_commits.ps1
+_fetch_astro.bat
+_probe.ps1
+_check_eol.ps1
+
+# OpenCode session state
+.opencode/
