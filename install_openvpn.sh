@@ -1,106 +1,118 @@
 #!/bin/bash
+#
+# install_openvpn.sh -- thin, safe wrapper around angristan/openvpn-install
+#
+# This wrapper:
+#   1. checks that it is run as root
+#   2. downloads the upstream installer from a pinned commit (REF)
+#   3. optionally verifies the SHA-256 checksum (EXPECTED_SHA256)
+#   4. runs the installer, defaulting to "interactive" when no args are given
+#
+# All OpenVPN client/server management commands are provided by upstream:
+#   install, uninstall, client add|list|revoke|renew,
+#   server status|renew, interactive
+#
+# This script intentionally does NOT print private keys, and does not leave
+# any copy of the upstream installer in the current working directory.
+
 set -euo pipefail
 
-# Define colors
-declare -A COLORS=(
-    ["GREEN"]='\033[0;32m'
-    ["YELLOW"]='\033[1;33m'
-    ["RED"]='\033[0;31m'
-    ["BLUE"]='\033[0;34m'
-    ["NC"]='\033[0m' # No Color
-)
+# Pinned upstream commit (angristan/openvpn-install, branch: master)
+REF="ad22fd9eb0c8569a885f836ef6e37576d8702e9f"
 
-# Function to install OpenVPN
-install_openvpn() {
-    echo -e "${COLORS["GREEN"]}Installing OpenVPN...${COLORS["NC"]}"
-    echo ""
-    curl -O https://raw.githubusercontent.com/angristan/openvpn-install/master/openvpn-install.sh
-    chmod +x openvpn-install.sh
-    ./openvpn-install.sh
-    echo ""
-    echo -e "OpenVPN installation completed. Press ${COLORS["RED"]}ENTER${COLORS["NC"]} to return to the menu."
-    read -s -n  1
-}
+# Optional: set to the expected SHA-256 of the downloaded installer to
+# verify integrity before executing it. Leave empty to skip verification.
+EXPECTED_SHA256=""
 
-# Function to display certificate details
-display_certificates() {
-    local client_name
-    read -p "Enter the name of the client for which you want to display certificates: " client_name
-    if [[ -z "$client_name" ]]; then
-        echo -e "${COLORS["RED"]}Client name cannot be empty.${COLORS["NC"]}"
-        return
+UPSTREAM_URL="https://raw.githubusercontent.com/angristan/openvpn-install/${REF}/openvpn-install.sh"
+
+# Upstream keeps everything under /etc/openvpn/server/.
+OVPN_DIR="/etc/openvpn/server"
+
+# --- root check -------------------------------------------------------------
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "Error: this script must be run as root." >&2
+    echo "Try:  sudo bash $0 $*" >&2
+    exit 1
+fi
+
+# --- show client info (safe: no private keys, validated name) ---------------
+# Print a client's generated .ovpn config path and certificate location only.
+# Private key files are never displayed.
+show_client_info() {
+    local client_name="$1"
+
+    if [[ ! "$client_name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        echo "Invalid client name: '$client_name'." >&2
+        echo "Client names may only contain A-Z, a-z, 0-9, '-' and '_'." >&2
+        return 1
     fi
-    cat "/etc/openvpn/easy-rsa/pki/ca.crt"
-    echo ""
-    awk '/BEGIN/,/END CERTIFICATE/' "/etc/openvpn/easy-rsa/pki/issued/$client_name.crt"
-    echo ""
-    cat "/etc/openvpn/easy-rsa/pki/private/$client_name.key"
-    echo ""
-    cat /etc/openvpn/tls-crypt.key
-    echo ""
-    cat /etc/openvpn/tls-auth.key
-    echo ""
-    echo -e "Certificate details displayed. Press ${COLORS["RED"]}ENTER${COLORS["NC"]} to return to the menu."
-    read -s -n  1
+
+    local ovpn_cert="${OVPN_DIR}/easy-rsa/pki/issued/${client_name}.crt"
+    local ovpn_key="${OVPN_DIR}/easy-rsa/pki/private/${client_name}.key"
+
+    if [[ ! -f "$ovpn_cert" ]]; then
+        echo "Client '$client_name' not found at $ovpn_cert." >&2
+        echo "Run '$0 client list' to see configured clients." >&2
+        return 1
+    fi
+
+    echo "=== Client: $client_name ==="
+    echo
+    echo "Certificate file: $ovpn_cert"
+
+    # The .ovpn config is written to the user's home directory (or /root).
+    for dir in /root /home/*; do
+        if [[ -f "${dir}/${client_name}.ovpn" ]]; then
+            echo "Client config (.ovpn): ${dir}/${client_name}.ovpn"
+            echo
+            echo "Private key is at: $ovpn_key (not displayed for security)."
+            echo "Copy the .ovpn file to your device to connect."
+            return 0
+        fi
+    done
+    echo
+    echo "No .ovpn file found in /root or /home. The client may have been"
+    echo "added but the config was not written to a home directory yet."
+    return 0
 }
 
-# Function to display help information
-display_help() {
-    echo -e "${COLORS["GREEN"]}Usage: $0 [options]"
-    echo -e "Options:"
-    echo -e "  -h, --help    Show this help message."
-    echo -e "  -i, --install Install OpenVPN."
-    echo -e "  -d, --details Display client certificate details."
-    echo -e "${COLORS["NC"]}"
-}
+# --- dispatch before any network work ---------------------------------------
+# If the user asked to inspect a client, do that locally without downloading.
+if [[ "${1:-}" == "client-info" || "${1:-}" == "--client-info" ]]; then
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: $0 client-info <client-name>" >&2
+        exit 1
+    fi
+    show_client_info "$2"
+    exit 0
+fi
 
-# Parse command-line arguments
-while (( "$#" )); do
-    case "$1" in
-        -h|--help)
-            display_help
-            exit   0
-            ;;
-        -i|--install)
-            install_openvpn
-            exit   0
-            ;;
-        -d|--details)
-            display_certificates
-            exit   0
-            ;;
-        *)
-            echo "Invalid option. Use -h or --help for usage information."
-            exit   1
-            ;;
-    esac
-    shift
-done
+# --- download + verify + run ------------------------------------------------
+tmp_installer="$(mktemp "${TMPDIR:-/tmp}/openvpn-install.XXXXXX")"
+cleanup() { rm -f "$tmp_installer" 2>/dev/null || true; }
+trap cleanup EXIT
 
-# Main menu loop
-while true; do
-    echo -e "${COLORS["GREEN"]}+------------------------------------------+"
-    echo -e "¦           ${COLORS["BLUE"]}OpenVPN Management Script${COLORS["GREEN"]}            ¦"
-    echo -e "¦------------------------------------------¦"
-    echo -e "¦ ${COLORS["YELLOW"]}1${COLORS["NC"]}. Install OpenVPN             ${COLORS["GREEN"]}   ¦"
-    echo -e "¦ ${COLORS["YELLOW"]}2${COLORS["NC"]}. Display Client Certificate Details${COLORS["GREEN"]}    ¦"
-    echo -e "¦ ${COLORS["RED"]}0${COLORS["NC"]}. Exit                                 ${COLORS["GREEN"]}   ¦"
-    echo -e "+------------------------------------------+${COLORS["NC"]}"
-    read -p "Enter your choice: " choice
+echo "Downloading OpenVPN installer (commit ${REF:0:7})..." >&2
+if ! curl -fsSL --retry 3 -o "$tmp_installer" "$UPSTREAM_URL"; then
+    echo "Error: failed to download OpenVPN installer from $UPSTREAM_URL" >&2
+    exit 1
+fi
 
-    case "$choice" in
-        1)
-            install_openvpn
-            ;;
-        2)
-            display_certificates
-            ;;
-        0)
-            echo -e "${COLORS["RED"]}Exiting...${COLORS["NC"]}"
-            exit   0
-            ;;
-        *)
-            echo -e "${COLORS["RED"]}Invalid choice. Try again.${COLORS["NC"]}"
-            ;;
-    esac
-done
+if [[ -n "$EXPECTED_SHA256" ]]; then
+    actual_sha256="$(sha256sum "$tmp_installer" | awk '{print $1}')"
+    if [[ "$actual_sha256" != "$EXPECTED_SHA256" ]]; then
+        echo "Error: SHA-256 mismatch!" >&2
+        echo "  expected: $EXPECTED_SHA256" >&2
+        echo "  actual:   $actual_sha256" >&2
+        exit 1
+    fi
+    echo "SHA-256 verified OK." >&2
+fi
+
+# Run the installer; default to "interactive" when no arguments are supplied.
+if [[ $# -eq 0 ]]; then
+    exec bash "$tmp_installer" interactive
+else
+    exec bash "$tmp_installer" "$@"
+fi
