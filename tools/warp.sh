@@ -2,9 +2,9 @@
 #
 # tools/warp.sh -- Cloudflare WARP client
 #
-# Installs the Cloudflare WARP client from Cloudflare's official apt/yum
-# repository, registers the device, connects to the Warp network, and
-# manages the client lifecycle. Subcommands:
+# Installs the Cloudflare WARP client from Cloudflare's official repository
+# (https://pkg.cloudflareclient.com), registers the device, connects to the
+# Warp network, and manages the client lifecycle. Subcommands:
 #
 #   install      install WARP client + register + connect
 #   status       show current WARP status
@@ -12,7 +12,7 @@
 #   disconnect   disconnect from WARP
 #   uninstall    stop client, remove package, clean up config
 #
-# OS: Debian/Ubuntu (apt) and RHEL/CentOS/Fedora/Alma/Rocky (yum/dnf).
+# OS: Debian/Ubuntu (apt) and RHEL/Fedora/CentOS (dnf/yum).
 #
 
 set -euo pipefail
@@ -24,9 +24,8 @@ NC='\033[0m'
 
 WARP_BIN="warp-cli"
 WARP_SERVICE="warp-svc"
-REPO_DEB="https://pkg.cloudflareclient.com"
-REPO_RPM="https://pkg.cloudflareclient.com/rpm"
 CONFIGURED_MARKER="/etc/warp/.vpn-install-configured"
+KEYRING="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
 
 log() { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}Warning: $*${NC}" >&2; }
@@ -56,20 +55,35 @@ install_deb_repo() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get -yqq update
     apt-get -yqq install ca-certificates curl
-    # Cloudflare's repo setup (GPG key + apt source)
-    curl -fsSL "$REPO_DEB/cloudflare-client-stable.gpg" | gpg --dearmor > /usr/share/keyrings/cloudflare-client-stable.gpg
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-client-stable.gpg] $REPO/ warp-stable main" > /etc/apt/sources.list.d/cloudflare-client.list
+    # Cloudflare's official GPG key and apt source
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output "$KEYRING"
+    # Detect the distro codename for the apt source line.
+    local codename
+    if codename="$(lsb_release -cs 2>/dev/null)" && [[ -n "$codename" ]]; then
+        :
+    elif [[ -f /etc/os-release ]]; then
+        codename="$(grep -E '^VERSION_CODENAME=' /etc/os-release | cut -d= -f2 | tr -d '"' || true)"
+        if [[ -z "$codename" ]]; then
+            codename="$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' | cut -d. -f1 || true)"
+        fi
+    fi
+    if [[ -z "${codename:-}" ]]; then
+        err "Could not determine the distro codename for the apt source."
+        exit 1
+    fi
+    echo "deb [signed-by=${KEYRING}] https://pkg.cloudflareclient.com/ ${codename} main" \
+        > /etc/apt/sources.list.d/cloudflare-warp.list
     apt-get -yqq update
     apt-get -yqq install cloudflare-warp
 }
 
 install_rpm_repo() {
+    # Cloudflare's RPM repo file (single source for both dnf and yum)
+    curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
+        -o /etc/yum.repos.d/cloudflare-warp.repo
     if [[ "$PKG_MGR" == "dnf" ]]; then
-        dnf config-manager --add-repo "$REPO_RPM/cloudflare-warp-rpm.repo" 2>/dev/null || \
-            curl -fsSL "$REPO_RPM/cloudflare-warp-rpm.repo" -o /etc/yum.repos.d/cloudflare-warp.repo
         dnf -y install cloudflare-warp
     else
-        curl -fsSL "$REPO_RPM/cloudflare-warp-rpm.repo" -o /etc/yum.repos.d/cloudflare-warp.repo
         yum -y install cloudflare-warp
     fi
 }
@@ -80,23 +94,17 @@ cmd_install() {
     require_root
     detect_package_manager
     case "$PKG_MGR" in
-        apt)
-            install_deb_repo
-            ;;
-        dnf|yum)
-            install_rpm_repo
-            ;;
+        apt)  install_deb_repo ;;
+        dnf|yum) install_rpm_repo ;;
     esac
-    # Create a state directory marker so we can detect "our" install
     mkdir -p "$(dirname "$CONFIGURED_MARKER")"
     touch "$CONFIGURED_MARKER"
-    # Register and connect
     systemctl enable "$WARP_SERVICE"
     systemctl start "$WARP_SERVICE"
     log "Registering WARP device..."
     warp-cli register
     log "Setting mode to Warp (global)..."
-    warp-cli set mode warp
+    warp-cli set-mode warp
     warp-cli connect
     warp-cli status
     log "WARP installed and connected."
