@@ -124,6 +124,16 @@ cmd_issue() {
 
     log "Running certbot issue (mode=$mode) for: ${domains[*]}"
     certbot certonly "${args[@]}"
+
+    # Make sure automated renewal is active (systemd timer on modern
+    # Debian/Ubuntu, cron otherwise).
+    if command -v systemctl >/dev/null 2>&1 && [[ -f /etc/systemd/system/timers.target.wants/certbot.timer ]]; then
+        systemctl enable --now certbot.timer 2>/dev/null || true
+        log "Renewal timer enabled (certbot.timer)."
+    elif command -v certbot >/dev/null 2>&1; then
+        certbot renew --dry-run >/dev/null 2>&1 || true
+        log "Renewal available via 'certbot renew' (enable the timer or a cron job)."
+    fi
     touch "$CONFIGURED_MARKER"
     log "Certificate issued."
 }
@@ -146,6 +156,14 @@ cmd_status() {
             printf '%s: %s (notAfter: %s)\n' "$name" "$expiry" "$expiry_date"
         fi
     done
+    # Report whether automated renewal is active.
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet certbot.timer 2>/dev/null; then
+        log "Renewal: certbot.timer is active."
+    elif [[ -f /etc/cron.d/certbot ]]; then
+        log "Renewal: cron job present (/etc/cron.d/certbot)."
+    else
+        warn "Renewal: no active renewal timer or cron job found. Run 'ssl.sh renew' manually."
+    fi
 }
 
 cmd_renew() {

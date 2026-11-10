@@ -27,10 +27,12 @@ NC='\033[0m'
 
 MARKER="vpn-install-tunnel"
 SYSCONF="/etc/sysctl.d/99-vpn-install-forward.conf"
+NAT_PERSIST="/etc/iptables-tunnel/nat.rules.v4"
+NAT_PERSIST_DIR="$(dirname "$NAT_PERSIST")"
 
-log() { echo -e "${GREEN}$*${NC}"; }
+log()  { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}Warning: $*${NC}" >&2; }
-err() { echo -e "${RED}$*${NC}" >&2; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -93,6 +95,46 @@ have_iptables() {
 # exactly one rule at a time.
 tag() { printf '%s:%s:%s:%s:%s' "$MARKER" "$1" "$2" "$3" "$4"; }
 
+# Persist our NAT rules across reboots.
+persist_nat_rules() {
+    mkdir -p "$NAT_PERSIST_DIR"
+    iptables-save -t nat > "$NAT_PERSIST"
+    # Enable the persist service so it loads on boot.
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ ! -f "/etc/systemd/system/iptables-tunnel-persist.service" ]]; then
+            cat > "/etc/systemd/system/iptables-tunnel-persist.service" <<EOF
+[Unit]
+Description=Persist iptables tunnel rules
+Before=network.target
+After=systemd-sysv-generator.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/iptables-restore < ${NAT_PERSIST}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+        fi
+        systemctl enable iptables-tunnel-persist.service
+        systemctl start iptables-tunnel-persist.service
+    fi
+}
+
+remove_persist() {
+    rm -f "$NAT_PERSIST"
+    if command -v systemctl >/dev/null 2>&1; then
+        if [[ -f "/etc/systemd/system/iptables-tunnel-persist.service" ]]; then
+            systemctl stop iptables-tunnel-persist.service 2>/dev/null || true
+            systemctl disable iptables-tunnel-persist.service 2>/dev/null || true
+            rm -f "/etc/systemd/system/iptables-tunnel-persist.service"
+            systemctl daemon-reload
+        fi
+    fi
+}
+
 # --- subcommands ------------------------------------------------------------
 
 cmd_add() {
@@ -136,7 +178,11 @@ cmd_add() {
         -j ACCEPT \
         -m comment --comment "$t"
 
+    # Persist the NAT rules.
+    persist_nat_rules
+
     log "Forwarding $proto/$lport -> ${dip}:${dport} (tag $t)."
+    log "Rules persisted to $NAT_PERSIST and reloaded at boot."
 }
 
 cmd_list() {
@@ -183,6 +229,8 @@ cmd_remove() {
         iptables -D FORWARD -d "${dip}/32" -p "$proto" --dport "$dport" \
             -j ACCEPT -m comment --comment "$t"
     done
+    # Re-persist after removal
+    persist_nat_rules
     log "Removed rules for $proto/$lport -> ${dip}:${dport}."
 }
 
@@ -192,25 +240,17 @@ cmd_uninstall() {
     local lines
     lines="$(iptables-save 2>/dev/null | grep -F "$MARKER" || true)"
     if [[ -n "$lines" ]]; then
-        # Best-effort: delete each tagged rule by re-adding it to the filter
-        # (comment matches are the only reliable deletion key). We remove from
-        # the four chains we control, in order.
-        local t proto lport dip dport
+        local t proto lport dip dport line
         while IFS= read -r line; do
             [[ -z "$line" ]] && continue
-            # A saved rule looks like:  -A CHAIN ... -m comment --comment vpn-install-tunnel:...
-            # We only need to undo the add we did; since we can't reliably
-            # reconstruct the full -D spec from a saved line, we ask the user
-            # to run 'remove' per rule if needed. Here we just clear the
-            # persistent state so a reboot starts clean.
             t="${line##--comment }"
             t="${t#"$MARKER":}"
-            # t now looks like "tcp:8080:1.2.3.4:9090"
             IFS=':' read -r proto lport dip dport <<< "$t"
             [[ -z "$proto" || -z "$lport" || -z "$dip" || -z "$dport" ]] && continue
             cmd_remove "$lport" "$dip" "$dport" "$proto" || warn "Could not remove $proto/$lport -> ${dip}:${dport}"
         done <<< "$lines"
     fi
+    remove_persist
     rm -f "$SYSCONF"
     sysctl -w net.ipv4.ip_forward=0 2>/dev/null || true
     log "Tunnel uninstall complete."
