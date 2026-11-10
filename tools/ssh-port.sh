@@ -2,24 +2,32 @@
 #
 # tools/ssh-port.sh -- safely change the SSH port
 #
-# Backs up the current sshd_config, validates the new port (1024-65535, not
-# currently in use), opens the new port in the firewall BEFORE touching
-# sshd, tests the new config with `sshd -t`, reloads sshd, and prints a
-# clear warning to open a second session to verify access before closing
-# the current one. The old port is NOT disabled until you explicitly run
-# `disable-old-port`. Subcommands:
+# Design (be careful: a bug here can lock you out of your server):
 #
 #   change <new-port>
-#       back up + firewall + sshd -t + reload, keep old port open
+#       1. take a pristine backup of the current sshd_config (only the first
+#          time, plus a timestamped pre-change backup)
+#       2. validate the new port (1024-65535, not currently in use)
+#       3. open the NEW port in the firewall FIRST and verify the rule exists
+#       4. make sshd listen on BOTH the old and the new port (never comment
+#          out the old one yet)
+#       5. handle both socket-activated (ssh.socket) and plain ssh.service
+#       6. run sshd -t; on failure restore the exact backup and exit non-zero
+#       7. reload/daemon-reload and verify sshd is actually listening on the
+#          new port (ss -ltnp); on failure roll back automatically
+#       8. print a strong warning: test a SECOND session before closing this
+#          one; the old port stays open until you run disable-old-port
+#
 #   disable-old-port
-#       close the previously-open old SSH port in the firewall and remove
-#       the "Port <old>" line from sshd_config (use only after you have
-#       verified access on the new port)
+#       close the previously-open old port in the firewall and remove the
+#       "Port <old>" line (run only after you have verified access on the
+#       new port).
+#
 #   status
-#       show current Port lines in sshd_config and firewall state
+#       show configured Port lines, firewall state, and our state file.
+#
 #   uninstall
-#       restore the backed-up sshd_config (original port) and close the
-#       port we opened
+#       restore the pristine original sshd_config and close the port we opened.
 #
 # OS: Debian/Ubuntu only.
 #
@@ -32,13 +40,16 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 SSHD_CONF="/etc/ssh/sshd_config"
-BACKUP_DIR="/etc/ssh/sshd-config-backups"
+INCLUDE_DIR="/etc/ssh/sshd_config.d"
+BACKUP_DIR="/etc/ssh/vpn-install-backups"
+PRISTINE="${BACKUP_DIR}/sshd_config.pristine"
 STATE_FILE="/etc/ssh/.vpn-install-ssh-port"
 SERVICE="ssh"
+SOCKET_UNIT="ssh.socket"
 
-log() { echo -e "${GREEN}$*${NC}"; }
+log()  { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}Warning: $*${NC}" >&2; }
-err() { echo -e "${RED}$*${NC}" >&2; }
+err()  { echo -e "${RED}$*${NC}" >&2; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -65,38 +76,100 @@ valid_port() {
         err "Invalid port '$p'. Must be 1024-65535."
         return 1
     fi
-    # Must not already be in use by another process
-    if ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | grep -qE "[:.]${p}\s*$"; then
-        err "Port $p is already in use."
+    if ss -tuln 2>/dev/null | awk 'NR>1 {print $5}' | grep -qE "[:.]${p}(\s|$)"; then
+        err "Port $p is already in use by another process."
         return 1
     fi
 }
 
+# --- firewall ---------------------------------------------------------------
+_ufw_active() {
+    command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'
+}
+_firewalld_active() {
+    command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null
+}
+
 open_firewall() {
     local port="$1"
-    if command -v ufw >/dev/null 2>&1 && ufw is active >/dev/null 2>&1; then
-        ufw allow "$port/tcp"
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --add-port="$port/tcp"
+    if _ufw_active; then
+        ufw allow "${port}/tcp"
+    elif _firewalld_active; then
+        firewall-cmd --permanent --add-port="${port}/tcp"
         firewall-cmd --reload
     else
-        warn "No active ufw/firewalld detected; assuming no host firewall. If you use iptables natively, open the port manually."
+        warn "No active ufw/firewalld detected; assuming no host firewall."
+        warn "If you use iptables natively, open ${port}/tcp manually."
     fi
 }
 
 close_firewall() {
     local port="$1"
-    if command -v ufw >/dev/null 2>&1 && ufw is active >/dev/null 2>&1; then
-        ufw delete allow "$port/tcp" || true
-    elif command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
-        firewall-cmd --permanent --remove-port="$port/tcp" || true
-        firewall-cmd --reload || true
+    if _ufw_active; then
+        ufw delete allow "${port}/tcp" 2>/dev/null || true
+    elif _firewalld_active; then
+        firewall-cmd --permanent --remove-port="${port}/tcp" 2>/dev/null || true
+        firewall-cmd --reload 2>/dev/null || true
     fi
 }
 
-current_ports() {
-    # Print the currently configured Port lines (one per line)
-    grep -Ei '^\s*Port\s+' "$SSHD_CONF" | sed -E 's/^\s*Port\s+([0-9]+).*/\1/' || true
+# Verify the firewall rule we just added actually exists (best-effort).
+verify_firewall_rule() {
+    local port="$1"
+    if _ufw_active; then
+        ufw status 2>/dev/null | grep -qE "^\s*${port}/tcp\s" && return 0
+    elif _firewalld_active; then
+        firewall-cmd --list-ports 2>/dev/null | tr ' ' '\n' | grep -qx "${port}/tcp" && return 0
+    fi
+    # No managed firewall; nothing to verify.
+    return 0
+}
+
+# --- sshd port state --------------------------------------------------------
+# Print all configured port numbers (from sshd_config and include dir), one
+# per line. Used to know the "old" port(s).
+configured_ports() {
+    {
+        grep -Ei '^[[:space:]]*Port[[:space:]]+' "$SSHD_CONF" 2>/dev/null | \
+            sed -E 's/^[[:space:]]*Port[[:space:]]+//; s/[[:space:]]+$//' || true
+        if [[ -d "$INCLUDE_DIR" ]]; then
+            for f in "$INCLUDE_DIR"/*.conf; do
+                [[ -f "$f" ]] || continue
+                grep -Ei '^[[:space:]]*Port[[:space:]]+' "$f" 2>/dev/null | \
+                    sed -E 's/^[[:space:]]*Port[[:space:]]+//; s/[[:space:]]+$//' || true
+            done
+        fi
+    } | tr ' ' '\n' | grep -E '^[0-9]+$' || true
+}
+
+is_socket_activated() {
+    systemctl is-active --quiet "$SOCKET_UNIT" 2>/dev/null
+}
+
+# --- backup / restore -------------------------------------------------------
+# take_backups echoes the path of the timestamped backup it just made.
+take_backups() {
+    mkdir -p "$BACKUP_DIR"
+    # Pristine copy only if it does not exist yet.
+    if [[ ! -f "$PRISTINE" ]]; then
+        cp -a "$SSHD_CONF" "$PRISTINE"
+        log "Saved pristine sshd_config backup to $PRISTINE"
+    fi
+    # Timestamped pre-change backup; echo its path for the caller to use.
+    local ts_bak
+    ts_bak="${SSHD_CONF}.bak.$(date +%s)"
+    cp -a "$SSHD_CONF" "$ts_bak"
+    printf '%s\n' "$ts_bak"
+}
+
+restore_pristine() {
+    if [[ -f "$PRISTINE" ]]; then
+        cp -a "$PRISTINE" "$SSHD_CONF"
+        log "Restored sshd_config from $PRISTINE"
+        return 0
+    fi
+    warn "No pristine backup at $PRISTINE; leaving sshd_config as-is."
+    return 1
 }
 
 # --- subcommands ------------------------------------------------------------
@@ -107,50 +180,101 @@ cmd_change() {
     local new_port="$1"
     valid_port "$new_port"
 
-    # Back up the original config (only the first time, or overwrite)
-    mkdir -p "$BACKUP_DIR"
-    cp -n "$SSHD_CONF" "${BACKUP_DIR}/sshd_config.orig.$(date +%s)" 2>/dev/null || \
-        cp "$SSHD_CONF" "${BACKUP_DIR}/sshd_config.orig.$(date +%s)"
+    # 1. Backups (echoes the timestamped backup path).
+    local ts_bak
+    ts_bak="$(take_backups)"
 
-    # Record the old port so we can close it later
-    local old_port=""
-    local first
-    first="$(current_ports | head -n1)"
-    old_port="${first:-22}"
+    # 2. Record the old port(s) so disable-old-port / uninstall can target them.
+    local old_ports
+    old_ports="$(configured_ports)"
+    local old_port
+    old_port="$(echo "$old_ports" | grep -E '^[0-9]+$' | head -n1 || true)"
+    [[ -z "${old_port:-}" ]] && old_port="22"
+    # Store: line1 = old_port, line2 = new_port
     printf '%s\n%s\n' "$old_port" "$new_port" > "$STATE_FILE"
 
-    # Open the NEW port in the firewall FIRST
+    # 3. Open the NEW port in the firewall FIRST, and verify.
     log "Opening firewall for port $new_port..."
     open_firewall "$new_port"
-
-    # Edit sshd_config: comment out all existing Port lines, add the new one
-    local tmp
-    tmp="$(mktemp /tmp/sshd_config.XXXXXX)"
-    # Back up the live file before we edit it
-    cp "$SSHD_CONF" "${SSHD_CONF}.bak.$(date +%s)"
-    sed -E 's/^\s*Port\s+/#&/' "$SSHD_CONF" > "$tmp"
-    echo "Port $new_port" >> "$tmp"
-    cat "$tmp" > "$SSHD_CONF"
-    rm -f "$tmp"
-
-    # Test before reloading
-    log "Testing new sshd_config..."
-    if ! sshd -t; then
-        err "sshd -t failed. Restoring backup."
-        local latest_bak
-        latest_bak="$(find "$(dirname "$SSHD_CONF")" -maxdepth 1 -name "${SSHD_CONF}.bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)"
-        [[ -n "$latest_bak" ]] && cat "$latest_bak" > "$SSHD_CONF"
+    if ! verify_firewall_rule "$new_port"; then
+        err "Could not verify firewall rule for $new_port. Aborting before touching sshd."
+        close_firewall "$new_port"
         exit 1
     fi
 
+    # 4. Edit sshd_config: comment out all existing Port lines (in the main
+    #    file AND the include dir), then explicitly write the old AND new
+    #    ports so both stay open until disable-old-port runs.
+    local tmp
+    tmp="$(mktemp /tmp/sshd_config.XXXXXX)"
+    sed -E 's/^[[:space:]]*Port[[:space:]]+/#Port /' "$SSHD_CONF" > "$tmp"
+    # Remove the old line and append both ports.
+    # (The sed above already commented existing Port lines; we now append the
+    #  canonical ones at the end.)
+    echo "Port ${old_port}" >> "$tmp"
+    echo "Port ${new_port}" >> "$tmp"
+    cat "$tmp" > "$SSHD_CONF"
+    rm -f "$tmp"
+
+    # Also neutralize any Port lines in the include dir (they would override).
+    if [[ -d "$INCLUDE_DIR" ]]; then
+        for f in "$INCLUDE_DIR"/*.conf; do
+            [[ -f "$f" ]] || continue
+            local ftmp
+            ftmp="$(mktemp /tmp/sshd_include.XXXXXX)"
+            sed -E 's/^[[:space:]]*Port[[:space:]]+/#&/' "$f" > "$ftmp"
+            cat "$ftmp" > "$f"
+            rm -f "$ftmp"
+        done
+    fi
+
+    # 5. Test the new config.
+    log "Testing new sshd_config (sshd -t)..."
+    if ! sshd -t; then
+        err "sshd -t failed. Restoring backup and rolling back."
+        cp -a "$ts_bak" "$SSHD_CONF"
+        close_firewall "$new_port"
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
+
+    # 6. Reload. Handle socket activation vs plain service.
     log "Reloading sshd..."
-    systemctl reload "$SERVICE"
+    if is_socket_activated; then
+        # Ubuntu 22.10+/24.04: ports come from ssh.socket (ListenStream).
+        # sshd -t passed; enable plain service too (belt and suspenders) and
+        # daemon-reload so the new config is picked up by the service.
+        systemctl daemon-reload
+        systemctl enable "$SERVICE" 2>/dev/null || true
+        systemctl restart "$SERVICE" 2>/dev/null || true
+    else
+        systemctl daemon-reload
+        systemctl reload-or-restart "$SERVICE"
+    fi
+
+    # 7. Verify sshd is actually listening on the new port.
+    log "Verifying sshd is listening on port $new_port..."
+    sleep 2
+    if ! ss -ltnp 2>/dev/null | grep -qE "[:.]${new_port}[[:space:]]"; then
+        err "sshd is NOT listening on $new_port after reload. Rolling back."
+        # Roll back config and firewall, restore the old port behaviour.
+        cp -a "$ts_bak" "$SSHD_CONF"
+        close_firewall "$new_port"
+        if is_socket_activated; then
+            systemctl daemon-reload
+            systemctl restart "$SERVICE" 2>/dev/null || true
+        else
+            systemctl reload-or-restart "$SERVICE" 2>/dev/null || true
+        fi
+        rm -f "$STATE_FILE"
+        exit 1
+    fi
 
     echo ""
-    warn "SSH is now also listening on port $new_port."
+    warn "SSH now also listens on port $new_port (old port $old_port is still open)."
     warn "Open a SECOND terminal and test:  ssh -p $new_port user@host"
-    warn "Only after that works, run 'disable-old-port' to close $old_port."
-    warn "Do NOT close this session until you have confirmed access."
+    warn "Only after that works, run:  ssh-port.sh disable-old-port"
+    warn "Do NOT close this session until you have confirmed access on $new_port."
 }
 
 cmd_disable_old_port() {
@@ -163,63 +287,79 @@ cmd_disable_old_port() {
     local old_port new_port
     old_port="$(sed -n '1p' "$STATE_FILE")"
     new_port="$(sed -n '2p' "$STATE_FILE")"
-    [[ -z "$new_port" ]] && { err "State file is incomplete."; exit 1; }
+    [[ -z "${new_port:-}" ]] && { err "State file is incomplete."; exit 1; }
 
     warn "Closing old SSH port $old_port. Make sure you can still reach $new_port."
-    close_firewall "$old_port"
-    # Remove the old Port line from sshd_config
-    local tmp
-    tmp="$(mktemp /tmp/sshd_config.XXXXXX)"
-    grep -vE "^\s*Port\s+${old_port}\s*$" "$SSHD_CONF" > "$tmp" || true
-    cat "$tmp" > "$SSHD_CONF"
-    rm -f "$tmp"
-    if ! sshd -t; then
-        err "sshd -t failed after closing old port. Re-add the old port line."
-        local tmp2
-        tmp2="$(mktemp /tmp/sshd_config.XXXXXX)"
-        grep -vE "^\s*Port\s+${old_port}\s*$" "$SSHD_CONF" > /dev/null 2>&1 || true
-        rm -f "$tmp2"
-        echo "Port $old_port" >> "$SSHD_CONF"
+
+    # Confirm the new port is reachable (still in use by sshd) before we
+    # remove the old one; this is the last safety net.
+    if ! ss -ltnp 2>/dev/null | grep -qE "[:.]${new_port}[[:space:]]"; then
+        err "New port $new_port is not currently listening. Refusing to close $old_port."
         exit 1
     fi
-    systemctl reload "$SERVICE"
+
+    close_firewall "$old_port"
+
+    # Remove only the old Port line from sshd_config.
+    local tmp
+    tmp="$(mktemp /tmp/sshd_config.XXXXXX)"
+    grep -vE "^[[:space:]]*Port[[:space:]]+${old_port}([[:space:]]|$)" "$SSHD_CONF" > "$tmp" || true
+    cat "$tmp" > "$SSHD_CONF"
+    rm -f "$tmp"
+
+    if ! sshd -t; then
+        err "sshd -t failed after closing old port. Reverting."
+        echo "Port ${old_port}" >> "$SSHD_CONF"
+        open_firewall "$old_port"
+        exit 1
+    fi
+    if is_socket_activated; then
+        systemctl daemon-reload
+        systemctl restart "$SERVICE" 2>/dev/null || true
+    else
+        systemctl reload-or-restart "$SERVICE"
+    fi
+    rm -f "$STATE_FILE"
     log "Old port $old_port closed. New port $new_port remains open."
 }
 
 cmd_status() {
     local ports
-    ports="$(current_ports)"
+    ports="$(configured_ports)"
     if [[ -n "$ports" ]]; then
         log "Configured SSH port(s): $(echo "$ports" | tr '\n' ' ')"
     else
-        log "No explicit Port line in sshd_config (default: 22)."
+        log "No explicit Port line (default: 22)."
+    fi
+    if is_socket_activated; then
+        log "SSH is socket-activated (ssh.socket)."
     fi
     if [[ -f "$STATE_FILE" ]]; then
         log "State file: old=$(sed -n '1p' "$STATE_FILE") new=$(sed -n '2p' "$STATE_FILE")"
     else
-        log "No state file (nothing has been changed yet)."
+        log "No state file (nothing changed yet)."
     fi
 }
 
 cmd_uninstall() {
     require_root
     detect_os
-    warn "Restoring the original sshd_config from $BACKUP_DIR and closing the port we opened."
-    local latest
-    latest="$(find "$BACKUP_DIR" -maxdepth 1 -name 'sshd_config.orig.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2- || true)"
-    if [[ -n "$latest" && -f "$latest" ]]; then
-        cp "$latest" "$SSHD_CONF"
-        log "Restored sshd_config from $latest."
-    else
-        warn "No backup found in $BACKUP_DIR; leaving sshd_config as-is."
-    fi
+    warn "Restoring the pristine sshd_config and closing the port we opened."
+    local new_port=""
     if [[ -f "$STATE_FILE" ]]; then
-        local new_port
         new_port="$(sed -n '2p' "$STATE_FILE")"
-        [[ -n "$new_port" ]] && close_firewall "$new_port"
-        rm -f "$STATE_FILE"
     fi
-    systemctl reload "$SERVICE"
+    restore_pristine
+    if [[ -n "$new_port" ]]; then
+        close_firewall "$new_port"
+    fi
+    rm -f "$STATE_FILE"
+    if is_socket_activated; then
+        systemctl daemon-reload
+        systemctl restart "$SERVICE" 2>/dev/null || true
+    else
+        systemctl reload-or-restart "$SERVICE" 2>/dev/null || true
+    fi
     log "Reverted. Verify your SSH still works on the original port."
 }
 
