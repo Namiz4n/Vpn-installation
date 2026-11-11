@@ -108,30 +108,43 @@ jobs:
 
       - name: Force a real sshd -t failure, assert the rollback restores the config
         # On a fresh Ubuntu runner the system sshd_config is clean. We append a
-        # `Match User nobody` block to the END of /etc/ssh/sshd_config so that
-        # when `change` appends its `Port` lines, they land INSIDE the Match
-        # block, which makes `sshd -t` fail ("Missing argument / Port" in a
-        # Match scope is not valid). This is the exact scenario that the
-        # polluted-capture bug (take_backups logging to stdout) caused the
+        # `Match User nobody` block to the END of /etc/ssh/sshd_config. The
+        # block itself is VALID, so `sshd -t` still passes at this point --
+        # but now any `Port` line the tool appends at the end lands INSIDE
+        # the Match block, which is what makes `sshd -t` fail during `change`.
+        # This is the exact scenario that the polluted-capture bug in
+        # take_backups (logging to stdout inside a $(...) capture) caused the
         # rollback to silently fail to restore.
+        #
+        # NOTE the ordering: we append the block FIRST, then snapshot the now-
+        # appended config to /tmp/before.conf. The tool's rollback target is
+        # the config as it stood at the start of the tool run (i.e. with the
+        # block present), so the "before" snapshot must match that state.
         #
         # We assert:
         #   (a) `bash tools/ssh-port.sh change 2323` exits NON-ZERO
-        #   (b) /etc/ssh/sshd_config is byte-identical to the "before" copy
-        #   (c) `sudo sshd -t` passes afterwards (config is clean)
+        #   (b) /etc/ssh/sshd_config is byte-identical to /tmp/before.conf
+        #       (the rollback restored the pre-change state exactly)
+        #   (c) `sudo sshd -t` passes afterwards (the restored config is clean)
         #   (d) the output does NOT contain "cp: cannot stat"
         run: |
           set -uo pipefail
-          # Take a snapshot BEFORE running the tool.
-          sudo cp /etc/ssh/sshd_config /tmp/before.conf
           # Clear any prior backups so we exercise the "first-run creates
           # pristine" path (the path that previously polluted the capture).
           sudo rm -rf /etc/ssh/vpn-install-backups
-          # Append a Match block that breaks the tool's config edit. The
-          # redirection must happen INSIDE the privileged shell, not by the
-          # unprivileged Actions shell.
+          # Append the Match block. The redirection must happen inside the
+          # privileged shell.
           sudo bash -c "printf 'Match User nobody\n    PasswordAuthentication no\n' >> /etc/ssh/sshd_config"
-          # Run the tool. It is expected to fail (sshd -t will fail).
+          # Snapshot AFTER the append: this is the state the tool will treat
+          # as its rollback target (it backs up the config as found at start).
+          sudo cp /etc/ssh/sshd_config /tmp/before.conf
+          # The config with the block present still passes sshd -t (the block
+          # is valid), so the tool's pre-flight check will not abort.
+          if ! sudo sshd -t; then
+            echo "::error::test setup broken: sshd -t failed before running the tool"
+            exit 1
+          fi
+          # Run the tool. It is expected to fail (its edit makes sshd -t fail).
           rc=0
           out="$(sudo bash tools/ssh-port.sh change 2323 2>&1)" || rc=$?
           echo "--- tool output ---"
@@ -147,7 +160,7 @@ jobs:
             sudo diff -u /tmp/before.conf /etc/ssh/sshd_config || true
             exit 1
           fi
-          # (c) sshd -t must pass now that the config is clean
+          # (c) sshd -t must pass now that the config is restored
           if ! sudo sshd -t; then
             echo "::error::sshd -t failed after rollback; config is still broken"
             exit 1
@@ -157,7 +170,7 @@ jobs:
             echo "::error::rollback emitted a 'cp: cannot stat' error (backup path was broken)"
             exit 1
           fi
-          echo "ssh-port.sh rollback verified: config restored, sshd -t clean, no cp errors."
+          echo "ssh-port.sh rollback verified: config restored byte-identically, sshd -t clean, no cp errors."
 
       - name: Happy-path dry-run (no service restarts)
         # With a clean system config, the generated config must (i) pass

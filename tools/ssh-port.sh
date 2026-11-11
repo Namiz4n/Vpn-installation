@@ -8,6 +8,9 @@
 #       1. take a pristine backup of the current sshd_config (only the first
 #          time, plus a timestamped pre-change backup)
 #       2. validate the new port (1024-65535, not currently in use)
+#       2b. verify the CURRENT config already passes `sshd -t`; if not, abort
+#           without writing anything (rolling back to a broken config would
+#           leave sshd unable to start)
 #       3. open the NEW port in the firewall FIRST and verify the rule exists
 #       4. make sshd listen on BOTH the old and the new port (never comment
 #          out the old one yet)
@@ -296,7 +299,20 @@ cmd_change() {
     local old_port
     old_port="$(echo "$old_ports" | grep -E '^[0-9]+$' | head -n1 || true)"
     [[ -z "${old_port:-}" ]] && old_port="22"
-    # Store: line1 = old_port, line2 = new_port
+
+    # 2b. Refuse to start from a broken config. Everything after this point
+    #     (backups, the Port edit, the rollback target) is derived from the
+    #     current sshd_config; if it does not already pass `sshd -t`, we would
+    #     "roll back" to a config that still fails and leave sshd unable to
+    #     start. Detect it up front and abort without writing anything.
+    log "Checking current sshd_config is valid before modifying it (sshd -t)..."
+    if ! sshd -t; then
+        err "The current sshd_config does not pass 'sshd -t'. Refusing to change"
+        err "the SSH port on top of a broken config. Fix /etc/ssh/sshd_config"
+        err "(and /etc/ssh/sshd_config.d/*.conf) first, then re-run."
+        exit 1
+    fi
+    # State: line1 = old_port, line2 = new_port
     printf '%s\n%s\n' "$old_port" "$new_port" > "$STATE_FILE"
 
     # 3. Open the NEW port in the firewall FIRST, and verify.
