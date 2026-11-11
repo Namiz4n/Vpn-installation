@@ -6,7 +6,7 @@
 # installer), WireGuard (via the standalone wireguard-install.sh in this
 # repo), and a set of first-party VPN/proxy tools that live in this
 # repository's tools/ directory (OpenConnect, MTProto, Cloudflare WARP,
-# port-forward tunnel, nginx reverse proxy, SSL certificate, SSH port).
+# PPTP, L2TP/IPsec, GRE tunnel).
 #
 # All child scripts are downloaded to a temp file and executed so nothing
 # is left behind in the current working directory.
@@ -82,11 +82,11 @@ while true; do
     echo -e "${YELLOW}+--------------------------------------------------------+${NC}"
     echo -e "${BLUE}|${YELLOW}  3.${NC} ${CYAN}OpenConnect VPN (ocserv)${NC}                           ${BLUE}|${NC}"
     echo -e "${BLUE}|${YELLOW}  4.${NC} ${CYAN}MTProto proxy (Telegram)${NC}                           ${BLUE}|${NC}"
+    echo -e "${YELLOW}+--------------------------------------------------------+${NC}"
     echo -e "${BLUE}|${YELLOW}  5.${NC} ${CYAN}Cloudflare WARP${NC}                                    ${BLUE}|${NC}"
-    echo -e "${BLUE}|${YELLOW}  6.${NC} ${CYAN}Port-forward tunnel (iptables/nftables)${NC}            ${BLUE}|${NC}"
-    echo -e "${BLUE}|${YELLOW}  7.${NC} ${CYAN}Nginx reverse proxy${NC}                                ${BLUE}|${NC}"
-    echo -e "${BLUE}|${YELLOW}  8.${NC} ${CYAN}SSL certificate (certbot)${NC}                          ${BLUE}|${NC}"
-    echo -e "${BLUE}|${YELLOW}  9.${NC} ${CYAN}Change SSH port${NC}                                    ${BLUE}|${NC}"
+    echo -e "${BLUE}|${YELLOW}  6.${NC} ${CYAN}PPTP VPN server${NC}                                    ${BLUE}|${NC}"
+    echo -e "${BLUE}|${YELLOW}  7.${NC} ${CYAN}L2TP/IPsec VPN server${NC}                              ${BLUE}|${NC}"
+    echo -e "${BLUE}|${YELLOW}  8.${NC} ${CYAN}GRE tunnel${NC}                                         ${BLUE}|${NC}"
     echo -e "${YELLOW}+--------------------------------------------------------+${NC}"
     echo -e "${BLUE}|${YELLOW}  0.${NC} ${RED}Quit${NC}                                               ${BLUE}|${NC}"
     echo -e "${YELLOW}+--------------------------------------------------------+${NC}"
@@ -110,16 +110,13 @@ while true; do
             run_remote_script "${RAW_BASE}/tools/warp.sh"
             ;;
         6)
-            run_remote_script "${RAW_BASE}/tools/tunnel.sh"
+            run_remote_script "${RAW_BASE}/tools/pptp.sh"
             ;;
         7)
-            run_remote_script "${RAW_BASE}/tools/reverse-proxy.sh"
+            run_remote_script "${RAW_BASE}/tools/l2tp.sh"
             ;;
         8)
-            run_remote_script "${RAW_BASE}/tools/ssl.sh"
-            ;;
-        9)
-            run_remote_script "${RAW_BASE}/tools/ssh-port.sh"
+            run_remote_script "${RAW_BASE}/tools/gre.sh"
             ;;
         0)
             echo -e "${GREEN}Exiting...${NC}"

@@ -4,13 +4,20 @@
 #
 # Installs the Cloudflare WARP client from Cloudflare's official repository
 # (https://pkg.cloudflareclient.com), registers the device, connects to the
-# Warp network, and manages the client lifecycle. Subcommands:
+# Warp network, and manages the client lifecycle.
 #
-#   install      install WARP client + register + connect
-#   status       show current WARP status
-#   connect      connect to WARP
-#   disconnect   disconnect from WARP
-#   uninstall    stop client, remove package, clean up config
+# UX (this script is self-contained and also launched with no arguments
+# from main.sh):
+#   * No arguments:
+#       - not installed -> guided install (prompts only if you are
+#         interactive; `--auto` skips every prompt),
+#       - installed     -> short numbered management menu.
+#   * Subcommands (power-user):
+#       install | status | connect | disconnect | uninstall
+#     -- these still work and take no prompts when combined with `--auto`.
+#   * `-h` / `--help`: print usage. Any other first argument that is not a
+#     known subcommand is treated as no-args, so running `warp.sh` alone
+#     never prints a Usage line.
 #
 # OS: Debian/Ubuntu (apt) and RHEL/Fedora/CentOS (dnf/yum).
 #
@@ -20,6 +27,7 @@ set -euo pipefail
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 WARP_BIN="warp-cli"
@@ -27,9 +35,24 @@ WARP_SERVICE="warp-svc"
 CONFIGURED_MARKER="/etc/warp/.vpn-install-configured"
 KEYRING="/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
 
+AUTO=0
+
 log() { echo -e "${GREEN}$*${NC}"; }
 warn() { echo -e "${YELLOW}Warning: $*${NC}" >&2; }
 err() { echo -e "${RED}$*${NC}" >&2; }
+info() { echo -e "${BLUE}$*${NC}"; }
+
+usage() {
+    cat <<EOF
+Usage: bash warp.sh [subcommand] [flags]
+  No arguments: guided install or management menu (recommended).
+  Subcommands: install | status | connect | disconnect | uninstall
+  Flags: --auto
+  -h / --help: this text.
+EOF
+}
+
+die() { err "$*"; exit 1; }
 
 require_root() {
     if [[ "$(id -u)" -ne 0 ]]; then
@@ -112,16 +135,15 @@ cmd_install() {
 
 cmd_status() {
     if ! command -v "$WARP_BIN" >/dev/null 2>&1; then
-        err "warp-cli not found. Run 'install' first."
-        exit 1
+        warn "warp-cli not found. Run 'install' first."
+        return 0
     fi
     warp-cli status
 }
 
 cmd_connect() {
     if ! command -v "$WARP_BIN" >/dev/null 2>&1; then
-        err "warp-cli not found. Run 'install' first."
-        exit 1
+        die "warp-cli not found. Run 'install' first."
     fi
     log "Connecting to WARP..."
     warp-cli connect
@@ -131,8 +153,7 @@ cmd_connect() {
 
 cmd_disconnect() {
     if ! command -v "$WARP_BIN" >/dev/null 2>&1; then
-        err "warp-cli not found. Run 'install' first."
-        exit 1
+        die "warp-cli not found. Run 'install' first."
     fi
     log "Disconnecting from WARP..."
     warp-cli disconnect
@@ -156,20 +177,104 @@ cmd_uninstall() {
     log "WARP uninstalled."
 }
 
-# --- dispatch ---------------------------------------------------------------
+# --- guided install / management menu ---------------------------------------
+guided_install() {
+    echo
+    echo "Cloudflare WARP client setup"
+    echo "  Package manager : $(detect_package_manager)"
+    echo
+    local yesno
+    if [[ -t 0 && "$AUTO" -eq 0 ]]; then
+        printf 'Proceed with WARP install? [Y/n] '
+        read -r yesno || yesno="Y"
+        if [[ "$yesno" =~ ^[Nn] ]]; then
+            die "Aborted before writing anything."
+        fi
+    fi
+    cmd_install
+}
+
+is_installed() {
+    [[ -f "$CONFIGURED_MARKER" ]] && command -v "$WARP_BIN" >/dev/null 2>&1
+}
+
+management_menu() {
+    local choice
+    while true; do
+        echo
+        echo "WARP client management menu"
+        echo "  1) Status"
+        echo "  2) Connect"
+        echo "  3) Disconnect"
+        echo "  4) Uninstall"
+        echo "  0) Back / exit"
+        printf 'Choice [0-4]: '
+        read -r choice || choice="0"
+        case "$choice" in
+            1) cmd_status ;;
+            2) cmd_connect ;;
+            3) cmd_disconnect ;;
+            4)
+                if ask_yes_no "Uninstall WARP client?" "n"; then
+                    cmd_uninstall
+                fi
+                ;;
+            0|*) break ;;
+        esac
+    done
+}
+
+ask_yes_no() {
+    local prompt="$1" default="$2" reply=""
+    if [[ -t 0 ]]; then
+        printf '%s [%s] ' "$prompt" "$default"
+        read -r reply || reply=""
+        reply="${reply:-$default}"
+        [[ "$reply" =~ ^[Yy] ]]
+    else
+        [[ "$default" =~ ^[Yy] ]]
+    fi
+}
+
+# --- dispatch -----------------------------------------------------------------
+cmd=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --auto) AUTO=1; shift ;;
+        install) cmd="install"; shift ;;
+        status) cmd="status"; shift ;;
+        connect) cmd="connect"; shift ;;
+        disconnect) cmd="disconnect"; shift ;;
+        uninstall) cmd="uninstall"; shift ;;
+        -*) warn "Unknown flag: $1 (ignored)"; shift ;;
+        *) cmd="${cmd:-default}"; shift ;;
+    esac
+done
 
 main() {
-    local cmd="${1:-help}"
     case "$cmd" in
         install)    cmd_install ;;
         status)     cmd_status ;;
         connect)    cmd_connect ;;
         disconnect) cmd_disconnect ;;
         uninstall)  cmd_uninstall ;;
-        help|*)
-            echo "Usage: warp.sh {install | status | connect | disconnect | uninstall}"
+        default|"")
+            if is_installed; then
+                management_menu
+            else
+                guided_install
+            fi
+            ;;
+        *)
+            warn "Unknown subcommand '$cmd' (treated as no-args)."
+            if is_installed; then
+                management_menu
+            else
+                guided_install
+            fi
             ;;
     esac
 }
 
-main "$@"
+main
