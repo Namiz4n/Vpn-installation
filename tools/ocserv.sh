@@ -160,6 +160,11 @@ ipv4-netmask = ${NETMASK}
 dns = 1.1.1.1
 dns = 8.8.8.8
 
+# IPC socket between the main and worker processes. This option is
+# required for ocserv --test-config to succeed; /run is the
+# package-standard location for it (see the ocserv sample config).
+socket-file = /run/ocserv.socket
+
 # Client limits
 max-clients = 64
 max-same-clients = 4
