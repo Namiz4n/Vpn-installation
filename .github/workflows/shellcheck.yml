@@ -55,15 +55,25 @@ jobs:
             -subj "/CN=vpn.local"
           # The password file referenced by the config must exist.
           sudo touch /etc/ocserv/ocpasswd
-          # Run the test; it must exit 0 and must not print "unknown option".
+          # The socket-file path must exist as a directory (it lives under
+          # /run, which is present on the runner).
+          sudo mkdir -p /run
+          # Run the test STRICTLY: capture both stdout and stderr, and fail
+          # if the exit code is non-zero OR if an "unknown option" warning
+          # was printed. No more `|| true` swallowing the real failure.
           set -o pipefail
-          out="$(sudo ocserv -c /tmp/ocserv-test.conf --test-config 2>&1)" || true
+          rc=0
+          out="$(sudo ocserv -c /tmp/ocserv-test.conf --test-config 2>&1)" || rc=$?
           echo "$out"
-          if echo "$out" | grep -q 'unknown option'; then
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::ocserv --test-config exited with code $rc"
+            exit 1
+          fi
+          if echo "$out" | grep -qi 'unknown option'; then
             echo "::error::ocserv --test-config reported an unknown option"
             exit 1
           fi
-          echo "ocserv config validated."
+          echo "ocserv config validated (exit 0, no unknown options)."
 
       - name: Validate generated nginx server block with nginx -t
         run: |
@@ -71,12 +81,20 @@ jobs:
           bash tools/reverse-proxy.sh print-config example.com 127.0.0.1:8080 8080 > /tmp/nginx-test.conf
           echo "--- generated nginx.conf ---"
           cat /tmp/nginx-test.conf
-          # Validate it. The include of mime.types may not exist in a bare
-          # config, so create it; nginx -t -c checks syntax.
-          sudo bash -c 'test -f /etc/nginx/mime.types || echo "types { };" > /etc/nginx/mime.types'
-          if ! sudo nginx -t -c /tmp/nginx-test.conf; then
-            # Fall back to a version that omits the mime.types include.
-            sed 's/^\s*include mime.types;\s*$//' /tmp/nginx-test.conf > /tmp/nginx-test2.conf
-            sudo nginx -t -c /tmp/nginx-test2.conf
+          # The generated config includes mime.types, which lives under
+          # /etc/nginx after `apt install nginx`. Create a stub if missing so
+          # the test is deterministic even on a bare runner.
+          sudo bash -c 'test -f /etc/nginx/mime.types || echo "types { };" | sudo tee /etc/nginx/mime.types'
+          # Run nginx -t STRICTLY: it must exit 0 on its own. Do not fall
+          # back to a rewritten config silently; if the generated block is
+          # wrong, the job fails.
+          set -o pipefail
+          rc=0
+          out="$(sudo nginx -t -c /tmp/nginx-test.conf 2>&1)" || rc=$?
+          echo "$out"
+          if [[ "$rc" -ne 0 ]]; then
+            echo "::error::nginx -t failed with exit code $rc"
+            echo "$out"
+            exit 1
           fi
-          echo "nginx config validated."
+          echo "nginx config validated (nginx -t exit 0)."
