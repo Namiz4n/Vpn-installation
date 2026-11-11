@@ -638,7 +638,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Apply the remoteip override, if given.
-if [[ "${REMOTEIP_RANGE_OVERRIDE:-}" != "" ]]; then
+if [[ -n "${REMOTEIP_RANGE_OVERRIDE:-}" ]]; then
     REMOTEIP_RANGE_OVERRIDE_SET=1
 fi
 
@@ -649,7 +649,9 @@ main() {
                 require_root
                 detect_os
                 compute_network_values
-                [[ -n "$REMOTEIP_RANGE_OVERRIDE_SET" ]] && REMOTEIP_RANGE="$REMOTEIP_RANGE_OVERRIDE"
+                if [[ -n "${REMOTEIP_RANGE_OVERRIDE_SET:-}" ]]; then
+                    REMOTEIP_RANGE="$REMOTEIP_RANGE_OVERRIDE"
+                fi
                 if [[ "$AUTO" -eq 1 && "$UNDERSTAND" -ne 1 ]]; then
                     die "--auto install requires --i-understand-pptp-is-insecure (or interactive 'yes')."
                 fi

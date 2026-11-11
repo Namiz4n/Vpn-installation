@@ -202,12 +202,14 @@ jobs:
           local_out="$(bash tools/gre.sh print-config --name gre0 \
             --local 203.0.113.1 --remote 203.0.113.2 \
             --inner-subnet 10.10.0.0/24)"
-          # Side A: link + inner address.
+          # Side A: link + inner address (from the generator output).
           sudo ip netns exec gre-test-a bash -c "$(grep 'ip link add' <<< "$local_out" | sed 's/^ *//')"
           sudo ip netns exec gre-test-a bash -c "$(grep 'ip addr add' <<< "$local_out" | sed 's/^ *//')"
           sudo ip netns exec gre-test-a ip link set gre0 up
-          # Side B (the pairing command, swapped).
+          # Side B (the pairing command, swapped; the generator emits it
+          # verbatim so both ends use the same code path).
           peer_cmd="$(grep 'bash gre.sh add' <<< "$local_out")"
+          echo "Peer-side command (for reference): $peer_cmd"
           sudo ip netns exec gre-test-b bash -c "
             ip link add gre0 type gre local 203.0.113.2 remote 203.0.113.1 mtu 1476
             ip addr add 10.10.0.2/30 peer 10.10.0.1 dev gre0
