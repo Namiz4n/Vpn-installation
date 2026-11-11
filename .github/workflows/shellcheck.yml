@@ -81,13 +81,8 @@ jobs:
           bash tools/reverse-proxy.sh print-config example.com 127.0.0.1:8080 8080 > /tmp/nginx-test.conf
           echo "--- generated nginx.conf ---"
           cat /tmp/nginx-test.conf
-          # The generated config includes mime.types, which lives under
-          # /etc/nginx after `apt install nginx`. Create a stub if missing so
-          # the test is deterministic even on a bare runner.
-          sudo bash -c 'test -f /etc/nginx/mime.types || echo "types { };" | sudo tee /etc/nginx/mime.types'
-          # Run nginx -t STRICTLY: it must exit 0 on its own. Do not fall
-          # back to a rewritten config silently; if the generated block is
-          # wrong, the job fails.
+          # Run nginx -t STRICTLY: it must exit 0 on its own. No fallback
+          # rewriting; if the generated block is wrong, the job fails.
           set -o pipefail
           rc=0
           out="$(sudo nginx -t -c /tmp/nginx-test.conf 2>&1)" || rc=$?

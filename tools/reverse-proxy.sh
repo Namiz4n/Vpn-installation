@@ -234,17 +234,20 @@ cmd_print_config() {
     valid_domain "$domain"
     valid_upstream "$upstream"
     valid_port "$listen_port"
+    {
     cat <<EOF
 worker_processes 1;
 pid /tmp/nginx-ci.pid;
 events {}
 http {
     access_log off;
-    include mime.types;
 
-$(server_block "$domain" "$upstream" "$listen_port" | sed 's/^/    /')
+EOF
+    server_block "$domain" "$upstream" "$listen_port" | sed 's/^/    /'
+    cat <<EOF
 }
 EOF
+    } | sed -E 's/[[:space:]]+$//'
 }
 
 cmd_uninstall() {
