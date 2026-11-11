@@ -93,3 +93,98 @@ jobs:
             exit 1
           fi
           echo "nginx config validated (nginx -t exit 0)."
+
+  ssh-port-rollback:
+    name: ssh-port.sh rollback & dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install openssh-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+
+      - name: Force a real sshd -t failure, assert the rollback restores the config
+        # On a fresh Ubuntu runner the system sshd_config is clean. We append a
+        # `Match User nobody` block to the END of /etc/ssh/sshd_config so that
+        # when `change` appends its `Port` lines, they land INSIDE the Match
+        # block, which makes `sshd -t` fail ("Missing argument / Port" in a
+        # Match scope is not valid). This is the exact scenario that the
+        # polluted-capture bug (take_backups logging to stdout) caused the
+        # rollback to silently fail to restore.
+        #
+        # We assert:
+        #   (a) `bash tools/ssh-port.sh change 2323` exits NON-ZERO
+        #   (b) /etc/ssh/sshd_config is byte-identical to the "before" copy
+        #   (c) `sudo sshd -t` passes afterwards (config is clean)
+        #   (d) the output does NOT contain "cp: cannot stat"
+        run: |
+          set -uo pipefail
+          # Take a snapshot BEFORE running the tool.
+          sudo cp /etc/ssh/sshd_config /tmp/before.conf
+          # Clear any prior backups so we exercise the "first-run creates
+          # pristine" path (the path that previously polluted the capture).
+          sudo rm -rf /etc/ssh/vpn-install-backups
+          # Append a Match block that breaks the tool's config edit.
+          sudo tee -a /etc/ssh/sshd_config >/dev/null <<'MATCH'
+Match User nobody
+    PasswordAuthentication no
+MATCH
+          # Run the tool. It is expected to fail (sshd -t will fail).
+          rc=0
+          out="$(sudo bash tools/ssh-port.sh change 2323 2>&1)" || rc=$?
+          echo "--- tool output ---"
+          echo "$out"
+          # (a) non-zero exit expected
+          if [[ "$rc" -eq 0 ]]; then
+            echo "::error::expected `change 2323` to fail, but it succeeded"
+            exit 1
+          fi
+          # (b) config must be byte-identical to the before copy
+          if ! sudo cmp -s /tmp/before.conf /etc/ssh/sshd_config; then
+            echo "::error::/etc/ssh/sshd_config was NOT restored to the 'before' state"
+            sudo diff -u /tmp/before.conf /etc/ssh/sshd_config || true
+            exit 1
+          fi
+          # (c) sshd -t must pass now that the config is clean
+          if ! sudo sshd -t; then
+            echo "::error::sshd -t failed after rollback; config is still broken"
+            exit 1
+          fi
+          # (d) no "cp: cannot stat" anywhere in the output
+          if grep -q 'cp: cannot stat' <<< "$out"; then
+            echo "::error::rollback emitted a 'cp: cannot stat' error (backup path was broken)"
+            exit 1
+          fi
+          echo "ssh-port.sh rollback verified: config restored, sshd -t clean, no cp errors."
+
+      - name: Happy-path dry-run (no service restarts)
+        # With a clean system config, the generated config must (i) pass
+        # `sshd -t` and (ii) contain both `Port 22` (old) and `Port <new>`.
+        # No systemctl, no firewall, no restart — only `sshd -t`.
+        run: |
+          set -uo pipefail
+          sudo rm -rf /etc/ssh/vpn-install-backups
+          # Reset the config to a clean state (undo the previous step's Match
+          # block, which was the point of that test).
+          sudo cp /tmp/before.conf /etc/ssh/sshd_config
+          bash tools/ssh-port.sh print-config 2323 > /tmp/sshport-dryrun.conf
+          echo "--- generated sshd_config ---"
+          cat /tmp/sshport-dryrun.conf
+          # (i) must pass sshd -t
+          if ! sudo sshd -t -f /tmp/sshport-dryrun.conf; then
+            echo "::error::generated config failed sshd -t"
+            exit 1
+          fi
+          # (ii) must contain BOTH the old and the new Port line
+          if ! grep -qE '^Port[[:space:]]+22([[:space:]]|$)' /tmp/sshport-dryrun.conf; then
+            echo "::error::generated config is missing 'Port 22' (old port)"
+            exit 1
+          fi
+          if ! grep -qE '^Port[[:space:]]+2323([[:space:]]|$)' /tmp/sshport-dryrun.conf; then
+            echo "::error::generated config is missing 'Port 2323' (new port)"
+            exit 1
+          fi
+          echo "ssh-port.sh dry-run verified: sshd -t clean and both Port lines present."
