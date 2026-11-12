@@ -121,7 +121,10 @@ jobs:
           # swanctl verify where available) after we drop the files in.
           sudo apt-get update
           sudo apt-get install -y strongswan xl2tpd ppp || true
-          bash tools/l2tp.sh print-config > /tmp/l2tp-dryrun.txt
+          # Pass an explicit public IP so the test is deterministic on a
+          # runner that has no public interface (CI runners do not).
+          bash tools/l2tp.sh print-config --public-ip 203.0.113.9 \
+            --psk 'TestPSK123456789012345' > /tmp/l2tp-dryrun.txt
           echo "--- generated files ---"
           cat /tmp/l2tp-dryrun.txt
           # Structural sanity checks (no real IPsec daemon is started in CI).

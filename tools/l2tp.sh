@@ -137,7 +137,8 @@ Usage: bash l2tp.sh [subcommand] [flags]
   Subcommands: install | add-user <name> | remove-user <name> | list-users
                | print-config | uninstall
   Flags: --auto, --psk <key>, --client-subnet <cidr>, --ip-range <a>-<b>,
-         --dns <a> [--dns <b>], --no-forwarding
+         --public-ip <ip> (default: auto-detected), --dns <a> [--dns <b>],
+         --no-forwarding
   -h / --help: this text.
 EOF
 }
@@ -179,14 +180,23 @@ default_iface() {
 }
 
 public_ip() {
-    # Best-effort public IP: first non-10/172.16/192.168 address, or the
-    # default-route peer's interface address.
-    local ip
-    ip="$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' | grep -vE '^(10\.|172\.(1[6-9]|[2-4][0-9])\.|192\.168\.)' | head -n1 || true)"
-    if [[ -z "$ip" ]]; then
-        local iface
-        iface="$(default_iface)"
-        ip="$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+    # Best-effort public IP: first non-RFC1918 / loopback address that is
+    # NOT a CIDR, falling back to the default-route interface's primary
+    # address. Callers validate the result; if nothing usable is found the
+    # caller dies with a clear message.
+    local ip iface
+    iface="$(default_iface)"
+    # Prefer the address on the default-route interface (the one that
+    # actually sends traffic to the internet).
+    ip="$(ip -4 -o addr show "$iface" 2>/dev/null | awk '{print $4}' | head -n1 || true)"
+    ip="${ip%/*}"
+    # If that was private/loopback, scan all interfaces for a public one.
+    if [[ -z "$ip" ]] || [[ "$ip" =~ ^127\. ]] || [[ "$ip" =~ ^10\. ]] \
+        || [[ "$ip" =~ ^192\.168\. ]] || [[ "$ip" =~ ^172\.(1[6-9]|[2-4][0-9])\. ]]; then
+        ip="$(ip -4 addr show 2>/dev/null | awk '/inet /{print $2}' \
+            | grep -vE '^127\.|^10\.|^192\.168\.|^172\.(1[6-9]|[2-4][0-9])\.' \
+            | head -n1 || true)"
+        ip="${ip%/*}"
     fi
     printf '%s' "$ip"
 }
@@ -718,6 +728,7 @@ while [[ $# -gt 0 ]]; do
         --psk) PSK="${2:-}"; shift 2 ;;
         --client-subnet) CLIENT_SUBNET="${2:-}"; shift 2 ;;
         --ip-range) IP_RANGE_OVERRIDE="${2:-}"; shift 2 ;;
+        --public-ip) PUBLIC_IP_OVERRIDE="${2:-}"; shift 2 ;;
         --dns) DNS1="${2:-}"; shift; [[ $# -gt 0 && "$1" == "--dns" ]] && DNS2="${2:-}" && shift 2 ;;
         --no-forwarding) DO_FORWARDING=0; shift ;;
         install) cmd="install"; shift ;;
